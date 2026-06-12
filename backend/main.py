@@ -19,8 +19,48 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
 # ── Logging ──────────────────────────────────────────────────────────────────
-logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
 log = logging.getLogger(__name__)
+
+# ── Optional config (.env) ─────────────────────────────────────────────────────
+# Load a local .env if python-dotenv is installed (it's optional — the server
+# runs fine without it; cloud OCR simply stays disabled).
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).parent / ".env")
+except Exception:
+    pass
+
+AZURE_DI_ENDPOINT = os.getenv("AZURE_DI_ENDPOINT", "").strip()
+AZURE_DI_KEY      = os.getenv("AZURE_DI_KEY", "").strip()
+GEMINI_API_KEY    = os.getenv("GEMINI_API_KEY", "").strip()
+
+
+def _azure_configured() -> bool:
+    """True only when both the Azure Document Intelligence endpoint and key are set."""
+    return bool(AZURE_DI_ENDPOINT and AZURE_DI_KEY)
+
+
+def _gemini_configured() -> bool:
+    """True when a Google Gemini (AI Studio) API key is set."""
+    return bool(GEMINI_API_KEY)
+
+
+def _cloud_ocr_engine() -> Optional[str]:
+    """Which cloud OCR engine is available: 'gemini' (preferred) > 'azure' > None."""
+    if _gemini_configured():
+        return "gemini"
+    if _azure_configured():
+        return "azure"
+    return None
+
+
+class CloudOCRUnavailable(Exception):
+    """Raised when a cloud OCR path can't run (not installed / not configured / API error)."""
 
 # ── App Setup ─────────────────────────────────────────────────────────────────
 app = FastAPI(title="DocToExcel API", version="1.0.0")
@@ -462,14 +502,33 @@ def _find_col_boundaries(line_groups: list[list[dict]], img_width: int) -> list[
     consecutive word pairs against a known-bigrams list.  Boundaries are placed at
     the midpoint between adjacent clusters, not between individual words.
     """
-    for line in line_groups:
-        texts = {w["text"].lower() for w in line}
-        if not (all(texts & grp for grp in _HEADER_REQUIRED_GROUPS) and len(line) >= 3):
-            continue
+    # Font-based header detection (lesson from professional converters):
+    # pdfplumber words carry 'fontname' and 'size'. Bold or larger-than-median
+    # text is almost certainly a header row even with fewer keyword matches.
+    all_sizes   = [w.get("size", 0) or 0 for line in line_groups for w in line]
+    median_size = sorted(all_sizes)[len(all_sizes) // 2] if all_sizes else 0.0
 
-        kw_count = sum(1 for w in line if w["text"].lower() in _HEADER_KEYWORDS)
-        if kw_count < len(line) / 2:
-            continue          # mostly non-keyword words → address/metadata line
+    def _is_bold_line(words: list[dict]) -> bool:
+        sizes = [w.get("size", 0) or 0 for w in words]
+        names = [w.get("fontname", "") or "" for w in words]
+        larger = sum(1 for s in sizes if s > median_size * 1.1) > len(sizes) * 0.5
+        bold   = any(tok in n for n in names for tok in ("Bold", "Heavy", "Black", "Demi"))
+        return larger or bold
+
+    for line in line_groups:
+        texts    = {w["text"].lower() for w in line}
+        is_bold  = _is_bold_line(line)
+
+        # Bold lines need only 1 keyword hit; non-bold need both required groups.
+        if is_bold:
+            if len(texts & _HEADER_KEYWORDS) < 1 or len(line) < 2:
+                continue
+        else:
+            if not (all(texts & grp for grp in _HEADER_REQUIRED_GROUPS) and len(line) >= 3):
+                continue
+            kw_count = sum(1 for w in line if w["text"].lower() in _HEADER_KEYWORDS)
+            if kw_count < len(line) / 2:
+                continue      # mostly non-keyword words → address/metadata line
 
         header_words = sorted(line, key=lambda w: w["left"])
 
@@ -758,9 +817,63 @@ def convert_pdf(content: bytes, stem: str, mode: str = "single", password: str =
 
     best_boundaries: list[int] | None = None
     page_data: list[tuple[int, int, list]] = []  # (page_num, img_width, line_groups)
+    # structured_sections: tables extracted via pdfplumber's grid detector (bypasses _merge_continuation_rows)
+    structured_sections: list[tuple[str, list[list[str]]]] = []
+
+    def _is_useful_table(t: list[list]) -> bool:
+        """Return True if pdfplumber table has ≥2 columns and ≥2 data rows."""
+        if not t or len(t) < 2:
+            return False
+        col_count = max((len(r) for r in t), default=0)
+        if col_count < 2:
+            return False
+        non_empty_rows = sum(1 for r in t if any(c and str(c).strip() for c in r))
+        return non_empty_rows >= 2
+
+    def _is_degenerate_table(t: list[list]) -> bool:
+        """
+        Detect a pdfplumber table whose ROW segmentation failed: a bank statement
+        with column lines but NO horizontal lines between transaction rows gets
+        an entire page crammed into one row, with each cell holding many
+        newline-separated values.  Signal: some cell holds far more text lines
+        than the table has rows.  Such pages must fall back to the word-based
+        banking pipeline (which segments rows correctly).
+        """
+        rows = len(t)
+        max_cell_lines = 0
+        for r in t:
+            for c in r:
+                if c:
+                    max_cell_lines = max(max_cell_lines, str(c).count("\n") + 1)
+        return max_cell_lines >= 4 and max_cell_lines > rows
 
     with pdf_file as pdf:
         for page_num, page in enumerate(pdf.pages, start=1):
+            # ── Try structured table extraction first (bordered PDFs) ──────────
+            try:
+                tables = page.extract_tables()
+            except Exception:
+                tables = []
+            page_tables = [t for t in (tables or []) if _is_useful_table(t)]
+            # If any extracted table is degenerate (rows not segmented — typical
+            # of bank statements with no inter-row lines), abandon the structured
+            # path for the WHOLE page and let the word-based pipeline handle it.
+            if page_tables and any(_is_degenerate_table(t) for t in page_tables):
+                page_tables = []
+            if page_tables:
+                for tbl_idx, tbl in enumerate(page_tables, start=1):
+                    # Normalise cells: None → ""
+                    rows = [[str(c).strip() if c is not None else "" for c in r] for r in tbl]
+                    rows = [r for r in rows if any(c for c in r)]
+                    if rows:
+                        title = sanitize_sheet_name(
+                            " ".join(c for c in rows[0] if c) or f"Page {page_num} T{tbl_idx}"
+                        )
+                        structured_sections.append((title, rows))
+                # Skip word-based extraction for this page — grid handled it
+                page_data.append((page_num, int(page.width), []))
+                continue
+
             raw = page.extract_words(keep_blank_chars=False, use_text_flow=False)
             if not raw:
                 page_data.append((page_num, int(page.width), []))
@@ -776,6 +889,9 @@ def convert_pdf(content: bytes, stem: str, mode: str = "single", password: str =
                 best_boundaries is None or len(boundaries) > len(best_boundaries)
             ):
                 best_boundaries = boundaries
+
+    # Structured tables go first (no _merge_continuation_rows needed)
+    all_sections.extend(structured_sections)
 
     # Build sections now that best_boundaries is known
     for page_num, img_width, line_groups in page_data:
@@ -803,13 +919,45 @@ def convert_pdf(content: bytes, stem: str, mode: str = "single", password: str =
         ws["A1"] = "No extractable content found in this PDF."
         return save_workbook(wb, stem)
 
+    # structured_sections came from extract_tables() (bordered tables) — don't apply
+    # banking-specific _build_single_sheet_rows to them.
+    has_structured = bool(structured_sections)
+    has_wordbased  = len(all_sections) > len(structured_sections)
+
     if mode == "single":
-        combined_rows = _build_single_sheet_rows(all_sections)
-        ws = wb.create_sheet(title="All Data")
-        write_data_to_sheet(ws, combined_rows, "All Data")
+        if has_structured and not has_wordbased:
+            # Pure grid-extracted PDF — stack tables with a blank-row separator
+            combined_rows: list[list[str]] = []
+            for i, (_name, rows) in enumerate(all_sections):
+                if i > 0:
+                    combined_rows.append([])  # blank row separator between tables
+                combined_rows.extend(rows)
+            ws = wb.create_sheet(title="All Data")
+            write_data_to_sheet(ws, combined_rows, "All Data")
+        elif has_structured:
+            # Mixed: structured tables first (simple concat), then banking sections
+            combined_rows = []
+            for _name, rows in structured_sections:
+                combined_rows.extend(rows)
+                combined_rows.append([])
+            word_sections = all_sections[len(structured_sections):]
+            if word_sections:
+                combined_rows.extend(_build_single_sheet_rows(word_sections))
+            ws = wb.create_sheet(title="All Data")
+            write_data_to_sheet(ws, combined_rows, "All Data")
+        else:
+            combined_rows = _build_single_sheet_rows(all_sections)
+            ws = wb.create_sheet(title="All Data")
+            write_data_to_sheet(ws, combined_rows, "All Data")
     else:
+        seen_names: dict[str, int] = {}
         for sheet_name, rows in all_sections:
             safe = sanitize_sheet_name(sheet_name)
+            if safe in seen_names:
+                seen_names[safe] += 1
+                safe = sanitize_sheet_name(f"{safe} {seen_names[safe]}")
+            else:
+                seen_names[safe] = 1
             ws = wb.create_sheet(title=safe)
             write_data_to_sheet(ws, rows, safe)
 
@@ -958,8 +1106,999 @@ def _merge_repeating_cols(rows: list[list[str]]) -> list[list[str]]:
     return stacked
 
 
+def _detect_table_grid(gray):
+    """
+    Detect a drawn table grid in a grayscale numpy image using morphological operations.
+    Returns:
+      (col_bounds, row_bounds)  — full grid (intersections found)
+      (None, row_bounds)        — row-only grid (horizontal lines, no verticals)
+      None                      — no grid detected
+    """
+    import cv2 as _cv2
+    import numpy as _np
+
+    h, w = gray.shape
+
+    def _cluster(values, tol=12):
+        vals = sorted(set(values))
+        if not vals:
+            return []
+        clusters = [[vals[0]]]
+        for v in vals[1:]:
+            if v - clusters[-1][-1] <= tol:
+                clusters[-1].append(v)
+            else:
+                clusters.append([v])
+        return sorted(sum(c) // len(c) for c in clusters)
+
+    # Global Otsu threshold — better than adaptive for detecting straight lines
+    _, binary = _cv2.threshold(gray, 0, 255, _cv2.THRESH_BINARY_INV + _cv2.THRESH_OTSU)
+
+    # Horizontal lines: long thin kernel (at least 1/10 of image width)
+    h_kernel_len = max(20, w // 10)
+    h_kernel = _cv2.getStructuringElement(_cv2.MORPH_RECT, (h_kernel_len, 1))
+    h_lines   = _cv2.morphologyEx(binary, _cv2.MORPH_OPEN, h_kernel)
+
+    # Vertical lines: tall thin kernel (at least 1/10 of image height)
+    v_kernel_len = max(20, h // 10)
+    v_kernel  = _cv2.getStructuringElement(_cv2.MORPH_RECT, (1, v_kernel_len))
+    v_lines   = _cv2.morphologyEx(binary, _cv2.MORPH_OPEN, v_kernel)
+
+    # ── Check for full grid (intersections) ───────────────────────────────────
+    intersections = _cv2.bitwise_and(h_lines, v_lines)
+    dilate_k = _cv2.getStructuringElement(_cv2.MORPH_RECT, (7, 7))
+    intersections = _cv2.dilate(intersections, dilate_k)
+    contours, _ = _cv2.findContours(intersections, _cv2.RETR_EXTERNAL, _cv2.CHAIN_APPROX_SIMPLE)
+
+    if contours:
+        centres = []
+        for cnt in contours:
+            x, y, cw, ch = _cv2.boundingRect(cnt)
+            centres.append((x + cw // 2, y + ch // 2))
+        xs = [c[0] for c in centres]
+        ys = [c[1] for c in centres]
+        col_bounds = _cluster(xs, tol=12)
+        row_bounds = _cluster(ys, tol=12)
+        if len(col_bounds) >= 3 and len(row_bounds) >= 3:
+            return col_bounds, row_bounds
+
+    return None
+
+
+def _detect_header_band(gray):
+    """
+    Detect a solid coloured header band (e.g. purple transaction-table header
+    with white text).  Returns (band_top, band_bottom) in pixel rows, or None.
+
+    Works on any background tint by using RELATIVE darkness: the header band is
+    markedly darker than the page-background median luminance.  This handles
+    both white-background documents and dark/tinted screenshots.
+    """
+    import numpy as _np
+    h, w = gray.shape
+    cx0, cx1 = w // 5, 4 * w // 5
+    row_lum    = gray[:, cx0:cx1].mean(axis=1)        # mean luminance per row
+    median_lum = float(_np.median(row_lum))           # page-background level
+    dark_thresh = median_lum * 0.65                   # band is ≥35 % darker
+    is_dark = row_lum < dark_thresh
+
+    # Collect runs of consecutive dark rows
+    bands = []
+    r = 0
+    while r < h:
+        if is_dark[r]:
+            start = r
+            while r < h and is_dark[r]:
+                r += 1
+            bands.append((start, r))
+        else:
+            r += 1
+
+    # Return the first band of plausible header height
+    max_h = max(60, h // 10)
+    for start, end in bands:
+        if 8 <= (end - start) <= max_h:
+            return start, end
+    return None
+
+
+def _columns_from_header_band(pil_img, band_top, band_bottom):
+    """
+    OCR a coloured header band by inverting it (white-text-on-dark → dark-on-
+    light) and return column boundary x-positions derived from the header
+    word positions.  Returns a sorted boundary list [0, b1, b2, ..., width]
+    or None if fewer than 3 header words are found.
+    """
+    try:
+        import pytesseract
+        from pytesseract import Output
+        from PIL import Image as _PILImage
+    except ImportError:
+        return None
+    import cv2 as _cv2
+    import numpy as _np
+
+    pad = 4
+    top = max(0, band_top - pad)
+    bot = min(pil_img.height, band_bottom + pad)
+    band = pil_img.crop((0, top, pil_img.width, bot))
+
+    gray = _np.array(band.convert("L"))
+    # Upscale for better OCR of the (often small) header text
+    scale = 3
+    gray = _cv2.resize(gray, (gray.shape[1] * scale, gray.shape[0] * scale),
+                       interpolation=_cv2.INTER_LANCZOS4)
+    # Invert: white text on dark BG → black text on light BG
+    inv = 255 - gray
+    _, bw = _cv2.threshold(inv, 0, 255, _cv2.THRESH_BINARY + _cv2.THRESH_OTSU)
+
+    data = pytesseract.image_to_data(
+        _PILImage.fromarray(bw), output_type=Output.DICT, config="--oem 3 --psm 6"
+    )
+    words = []
+    for i, txt in enumerate(data["text"]):
+        t = txt.strip()
+        if t and int(data["conf"][i]) > 20:
+            words.append({
+                "text": t,
+                "left":  data["left"][i] // scale,
+                "right": (data["left"][i] + data["width"][i]) // scale,
+            })
+    if len(words) < 3:
+        return None
+
+    words.sort(key=lambda x: x["left"])
+    # Column boundaries: midpoint between the right edge of word i and the
+    # left edge of word i+1.
+    bounds = [0]
+    for i in range(len(words) - 1):
+        bounds.append((words[i]["right"] + words[i + 1]["left"]) // 2)
+    bounds.append(pil_img.width)
+
+    # Clean header labels: strip non-ASCII OCR noise, then snap to the closest
+    # known column name when there's a clear match (fixes e.g. "O�SCRIPTION").
+    _KNOWN = ["DATE", "DESCRIPTION", "WITHDRAWAL", "DEPOSIT", "BALANCE",
+              "CREDIT", "DEBIT", "AMOUNT", "REFERENCE", "TYPE"]
+
+    import difflib
+
+    def _clean_label(raw: str) -> str:
+        cleaned = "".join(c for c in raw if c.isalnum() or c in " $.,-/").strip()
+        up = cleaned.upper()
+        # Snap to the closest known header via sequence similarity
+        best, best_score = cleaned, 0.0
+        for k in _KNOWN:
+            score = difflib.SequenceMatcher(None, up, k).ratio()
+            if score > best_score:
+                best, best_score = k, score
+        return best if best_score >= 0.6 else cleaned
+
+    labels = [_clean_label(w_["text"]) for w_ in words]
+    return bounds, labels
+
+
+def _extract_cells_from_grid(pil_img, col_bounds, row_bounds):
+    """
+    Given detected grid line positions, crop each cell from pil_img and OCR it
+    with PSM 7 (single text line) — far more accurate than whole-image OCR for small cells.
+    Returns list-of-rows (list[list[str]]), empty rows filtered out.
+    """
+    try:
+        import pytesseract
+        from pytesseract import Output
+        from PIL import Image as _PILImage
+    except ImportError:
+        return []
+
+    import cv2 as _cv2
+    import numpy as _np
+
+    # Scale factor: work on a 2x upscaled image for better per-cell OCR
+    scale = 2
+    img_big = pil_img.resize((pil_img.width * scale, pil_img.height * scale),
+                              resample=_PILImage.LANCZOS)
+    gray_big = _np.array(img_big.convert("L"))
+
+    cfg = "--oem 3 --psm 7"
+    rows: list[list[str]] = []
+
+    for ri in range(len(row_bounds) - 1):
+        y0 = max(0, row_bounds[ri]  * scale - 2)
+        y1 = min(gray_big.shape[0], row_bounds[ri + 1] * scale + 2)
+        row_cells: list[str] = []
+        for ci in range(len(col_bounds) - 1):
+            x0 = max(0, col_bounds[ci]  * scale - 2)
+            x1 = min(gray_big.shape[1], col_bounds[ci + 1] * scale + 2)
+            cell_gray = gray_big[y0:y1, x0:x1]
+            if cell_gray.size == 0:
+                row_cells.append("")
+                continue
+            # Adaptive threshold for the cell crop
+            _, cell_bw = _cv2.threshold(cell_gray, 0, 255,
+                                        _cv2.THRESH_BINARY + _cv2.THRESH_OTSU)
+            cell_img = _PILImage.fromarray(cell_bw)
+            text = pytesseract.image_to_string(cell_img, config=cfg).strip()
+            row_cells.append(text)
+        if any(c for c in row_cells):
+            rows.append(row_cells)
+
+    return rows
+
+
+_SCORE_GARBAGE_RE = _re.compile(r'^[\W_]+$')          # only punctuation/symbols
+_SCORE_REAL_RE    = _re.compile(r'[A-Za-z0-9]{2,}')   # a real token (≥2 alnum)
+
+def _score_table_rows(rows: list[list[str]]) -> float:
+    """
+    Rate how 'table-like' a candidate result is (higher = better).  Pure function
+    over the rows — no image needed.  Used to pick the best of several extraction
+    strategies (grid / header-band / word-based) so a strategy that mis-fires on a
+    given image simply loses to a cleaner candidate.
+
+    Signals:
+      + column-count consistency (most rows share the same #cells)
+      + content quality (cells with real ≥2-char tokens)
+      + fill ratio (few empty cells)
+      - garbage cells (lone punctuation, the U+FFFD replacement char, 1-char noise)
+      - implausible shape (too many columns, mostly-garbage)
+      * scaled by data-row count so a clean multi-row table beats a tiny fluke
+    """
+    if not rows:
+        return 0.0
+
+    # Drop fully-empty rows for measurement
+    data_rows = [r for r in rows if any(str(c).strip() for c in r)]
+    if not data_rows:
+        return 0.0
+
+    n_rows = len(data_rows)
+    col_counts = [len(r) for r in data_rows]
+    max_cols   = max(col_counts)
+
+    # Cell-level tallies
+    total_cells = 0
+    filled      = 0
+    real        = 0
+    garbage     = 0
+    for r in data_rows:
+        for c in r:
+            total_cells += 1
+            s = str(c).strip()
+            if not s:
+                continue
+            filled += 1
+            if "�" in s or (len(s) == 1 and not s.isalnum()) or _SCORE_GARBAGE_RE.match(s):
+                garbage += 1
+            elif _SCORE_REAL_RE.search(s):
+                real += 1
+
+    if filled == 0:
+        return 0.0
+
+    fill_ratio    = filled / total_cells
+    real_ratio    = real / filled
+    garbage_ratio = garbage / filled
+    real_per_row  = real / n_rows      # real cells per row = genuine column structure
+
+    # Column-count consistency: fraction of rows sharing the modal column count
+    from collections import Counter
+    modal_count, modal_freq = Counter(col_counts).most_common(1)[0]
+    consistency = modal_freq / n_rows
+
+    score = 0.0
+    score += consistency   * 2.0     # regular shape
+    score += real_ratio    * 2.5     # cells must hold REAL tokens, not fragments
+    score += fill_ratio    * 0.5     # density
+    score += min(real_per_row, 8.0) * 0.6   # reward real content split ACROSS columns
+    score -= garbage_ratio * 5.0     # punish OCR noise hard
+
+    # Sanity penalties for implausible shapes.  Real business tables rarely
+    # exceed ~8 columns; a bogus over-segmented grid (e.g. 16 cols of OCR
+    # fragments) is heavily penalised here so it loses to a clean candidate.
+    if max_cols > 8:
+        score -= (max_cols - 8) * 0.7
+    if garbage_ratio > 0.5:
+        score -= 3.0
+
+    # Scale by data volume (saturating) so clean multi-row tables win
+    import math
+    score *= (1.0 + math.log1p(n_rows) * 0.15)
+
+    return score
+
+
+def _columns_from_left_edges(line_groups, img_width):
+    """
+    Detect columns by clustering word LEFT edges across all lines.  Works well
+    for left-aligned tables (e.g. employee/project tables) where each column
+    starts at a consistent x even when row content length varies.  Returns a
+    boundary list [0, b1, ..., img_width] or None.
+    """
+    lefts = sorted(w["left"] for ln in line_groups for w in ln)
+    if len(lefts) < 4:
+        return None
+    tol = max(20, img_width // 26)
+    clusters = [[lefts[0]]]
+    for x in lefts[1:]:
+        if x - clusters[-1][-1] <= tol:
+            clusters[-1].append(x)
+        else:
+            clusters.append([x])
+    # Keep clusters that appear in a meaningful share of lines (real columns)
+    n = len(line_groups)
+    sig = [c for c in clusters if len(c) >= max(2, n * 0.4)]
+    if len(sig) < 2:
+        return None
+    centres = sorted(sum(c) // len(c) for c in sig)
+    bounds = [0]
+    for i in range(len(centres) - 1):
+        bounds.append((centres[i] + centres[i + 1]) // 2)
+    bounds.append(img_width)
+    return bounds if len(bounds) > 2 else None
+
+
+def _columns_from_ruled_lines(gray, img_width):
+    """
+    Detect FAINT vertical table borders on a light-background ruled table (e.g.
+    SBI/bank statement screenshots with thin grey gridlines) and return column
+    x-boundaries.  Otsu misses these lines because they're only slightly darker
+    than the near-white page, so use a fixed high threshold; long-kernel
+    morphology isolates the vertical rules from text.  Returns a boundary list
+    [0, b1, ..., img_width] or None.
+
+    Gated to light backgrounds (mean luminance > 200) so it can't fabricate a
+    grid from the foreground of a dark/inverted image.
+    """
+    import cv2 as _cv2
+    import numpy as _np
+
+    h, w = gray.shape
+    if float(gray.mean()) <= 200:
+        return None
+
+    binary = (gray < 240).astype("uint8") * 255          # catch faint grey rules
+    v_kernel = _cv2.getStructuringElement(_cv2.MORPH_RECT, (1, max(20, h // 8)))
+    v_lines = _cv2.morphologyEx(binary, _cv2.MORPH_OPEN, v_kernel)
+    contours, _ = _cv2.findContours(v_lines, _cv2.RETR_EXTERNAL, _cv2.CHAIN_APPROX_SIMPLE)
+
+    xs = []
+    for c in contours:
+        x, y, cw, ch = _cv2.boundingRect(c)
+        if ch > h * 0.2:                                 # real rules span much of the height
+            xs.append(x + cw // 2)
+    if len(xs) < 3:
+        return None
+
+    xs.sort()
+    clusters = [[xs[0]]]
+    for x in xs[1:]:
+        if x - clusters[-1][-1] <= 15:
+            clusters[-1].append(x)
+        else:
+            clusters.append([x])
+    centres = [sum(g) // len(g) for g in clusters]
+
+    # Build boundaries, then merge columns narrower than a min width — this drops
+    # the thin empty columns created by the table's outer border lines.
+    bounds = sorted(set([0] + centres + [w]))
+    min_w = max(15, img_width // 25)
+    merged = [bounds[0]]
+    for b in bounds[1:]:
+        if b - merged[-1] < min_w:
+            continue
+        merged.append(b)
+    if merged[-1] < w:
+        merged[-1] = w
+    return merged if len(merged) >= 4 else None          # need ≥3 real columns
+
+
+def _header_row_for_ruled(pil_img, gray, col_bounds):
+    """
+    Find the column-header row of a ruled table (the full-page OCR pass often
+    skips it because it sits sandwiched between horizontal rules) and OCR it on
+    its own.  Returns (header_cells, band_top) mapped to col_bounds, or None.
+
+    Strategy: detect horizontal rules (fixed threshold, like the vertical ones),
+    OCR each inter-rule band top-to-bottom, and take the first band that contains
+    ≥4 distinct table-header keywords.
+    """
+    try:
+        import pytesseract
+        from pytesseract import Output
+        from PIL import Image as _PILImage
+    except ImportError:
+        return None
+    import cv2 as _cv2
+    import numpy as _np
+
+    h, w = gray.shape
+    binary = (gray < 240).astype("uint8") * 255
+    h_kernel = _cv2.getStructuringElement(_cv2.MORPH_RECT, (max(20, w // 8), 1))
+    h_lines = _cv2.morphologyEx(binary, _cv2.MORPH_OPEN, h_kernel)
+    ys = [y for y in range(h) if h_lines[y].sum() / 255 > w * 0.4]
+    if len(ys) < 2:
+        return None
+    clusters = [[ys[0]]]
+    for y in ys[1:]:
+        if y - clusters[-1][-1] <= 8:
+            clusters[-1].append(y)
+        else:
+            clusters.append([y])
+    rules = [sum(g) // len(g) for g in clusters]
+
+    _HDR_KW = {"date", "narration", "description", "ref", "cheque", "debit", "credit",
+               "balance", "withdrawal", "deposit", "particulars", "value", "amount",
+               "transaction", "type", "no", "chq", "dr", "cr"}
+    for i in range(len(rules) - 1):
+        t, b = rules[i], rules[i + 1]
+        if not (12 <= b - t <= max(60, h // 8)):
+            continue
+        crop = pil_img.crop((0, max(0, t - 1), w, b + 1))
+        cg = _np.array(crop.convert("L"))
+        cg = _cv2.resize(cg, (cg.shape[1] * 3, cg.shape[0] * 3),
+                         interpolation=_cv2.INTER_LANCZOS4)
+        _, cb = _cv2.threshold(cg, 0, 255, _cv2.THRESH_BINARY + _cv2.THRESH_OTSU)
+        d = pytesseract.image_to_data(
+            _PILImage.fromarray(cb), output_type=Output.DICT, config="--oem 3 --psm 6"
+        )
+        words = [
+            {"text": d["text"][j].strip(),
+             "left": d["left"][j] // 3,
+             "right": (d["left"][j] + d["width"][j]) // 3}
+            for j in range(len(d["text"]))
+            if d["text"][j].strip() and int(d["conf"][j]) >= 0
+        ]
+        hits = sum(1 for wd in words if wd["text"].lower().strip(".():|") in _HDR_KW)
+        if hits >= 4:
+            cells = _line_to_cells_fixed(words, col_bounds)
+            cells = [c.strip().strip("|").strip() for c in cells]   # drop border pipes
+            return cells, t
+    return None
+
+
+# Transaction keywords that OCR sometimes glues to the preceding word in
+# all-caps statements (e.g. "POSPURCHASE", "PREAUTHORIZEDCREDIT").
+_GLUE_KEYWORDS = ("PURCHASE", "CREDIT", "DEBIT", "WITHDRAWAL", "DEPOSIT",
+                  "CHARGE", "PAYMENT", "TRANSFER", "INTEREST", "BALANCE")
+_GLUE_RE = _re.compile(r"^([A-Z]{2,})(" + "|".join(_GLUE_KEYWORDS) + r")$")
+
+def _desplit_glued(text: str) -> str:
+    """
+    Re-insert a missing space when OCR glued a known transaction keyword onto the
+    end of an all-caps word: 'POSPURCHASE' → 'POS PURCHASE', 'ATMWITHDRAWAL' →
+    'ATM WITHDRAWAL'.  Deliberately conservative: only all-caps tokens of the exact
+    form <prefix><keyword> where the keyword is at the END, so it can't damage
+    normal words (e.g. 'ACCREDITED', 'CREDITOR' are left untouched).
+    """
+    m = _GLUE_RE.match(text)
+    if m:
+        return f"{m.group(1)} {m.group(2)}"
+    return text
+
+
+def _azure_tables_to_rows(table) -> list[list[str]]:
+    """Convert one Azure Document Intelligence table object to a list-of-rows grid."""
+    n_rows = int(getattr(table, "row_count", 0) or 0)
+    n_cols = int(getattr(table, "column_count", 0) or 0)
+    if n_rows <= 0 or n_cols <= 0:
+        return []
+    grid = [["" for _ in range(n_cols)] for _ in range(n_rows)]
+    for cell in (table.cells or []):
+        r = int(getattr(cell, "row_index", 0) or 0)
+        c = int(getattr(cell, "column_index", 0) or 0)
+        if 0 <= r < n_rows and 0 <= c < n_cols:
+            grid[r][c] = (getattr(cell, "content", "") or "").strip()
+    return [row for row in grid if any(v.strip() for v in row)]
+
+
+def convert_image_azure(content: bytes, stem: str, mode: str = "single",
+                        merge_cols: bool = False) -> str:
+    """
+    Image → Excel via Azure AI Document Intelligence (prebuilt-layout), which
+    returns native table structure + high-accuracy OCR.  Raises CloudOCRUnavailable
+    when the SDK isn't installed, credentials are missing, or the API call fails,
+    so the caller can fall back to the Tesseract pipeline.
+    """
+    if not _azure_configured():
+        raise CloudOCRUnavailable("Azure Document Intelligence credentials are not configured.")
+    try:
+        from azure.core.credentials import AzureKeyCredential
+        from azure.ai.documentintelligence import DocumentIntelligenceClient
+        from azure.ai.documentintelligence.models import AnalyzeDocumentRequest
+    except ImportError as e:
+        raise CloudOCRUnavailable(
+            "azure-ai-documentintelligence is not installed. "
+            "Run: pip install azure-ai-documentintelligence"
+        ) from e
+
+    try:
+        client = DocumentIntelligenceClient(
+            endpoint=AZURE_DI_ENDPOINT,
+            credential=AzureKeyCredential(AZURE_DI_KEY),
+        )
+        # bytes_source is the version-stable way to send local image bytes
+        # (the SDK base64-encodes it); the raw-bytes `body=` form is flakier.
+        poller = client.begin_analyze_document(
+            "prebuilt-layout",
+            AnalyzeDocumentRequest(bytes_source=content),
+        )
+        result = poller.result()
+    except Exception as e:
+        raise CloudOCRUnavailable(f"Azure Document Intelligence call failed: {e}") from e
+
+    # Build (title, rows) sections from detected tables.
+    sections: list[tuple[str, list[list[str]]]] = []
+    for idx, table in enumerate(getattr(result, "tables", None) or [], start=1):
+        rows = _azure_tables_to_rows(table)
+        if merge_cols:
+            rows = _merge_repeating_cols(rows)
+        if rows:
+            title = sanitize_sheet_name(
+                " ".join(c for c in rows[0] if c.strip()) or f"Table {idx}"
+            )
+            sections.append((title, rows))
+
+    # No tables detected — fall back to the document's plain text content.
+    fallback_text = (getattr(result, "content", "") or "").strip()
+    return _cloud_sections_to_workbook(sections, stem, mode, fallback_text)
+
+
+def _cloud_sections_to_workbook(sections, stem, mode, fallback_text=""):
+    """Shared writer for cloud-OCR engines: list of (title, rows) → .xlsx.
+    single mode stacks tables with a blank-row separator; separate mode gives one
+    sheet per table (de-duplicating sheet names)."""
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)
+
+    if sections:
+        if mode == "single":
+            combined: list[list[str]] = []
+            for i, (_name, rows) in enumerate(sections):
+                if i > 0:
+                    combined.append([])          # blank-row separator between tables
+                combined.extend(rows)
+            ws = wb.create_sheet(title="All Data")
+            write_data_to_sheet(ws, combined, "All Data")
+        else:
+            seen: dict[str, int] = {}
+            for name, rows in sections:
+                safe = sanitize_sheet_name(name)
+                if safe in seen:
+                    seen[safe] += 1
+                    safe = sanitize_sheet_name(f"{safe} {seen[safe]}")
+                else:
+                    seen[safe] = 1
+                ws = wb.create_sheet(title=safe)
+                write_data_to_sheet(ws, rows, safe)
+    else:
+        rows = [[line] for line in fallback_text.splitlines() if line.strip()] or [["No content found."]]
+        ws = wb.create_sheet(title="Extracted Text")
+        write_data_to_sheet(ws, rows, "Extracted Text")
+
+    return save_workbook(wb, stem)
+
+
+# Override via env GEMINI_MODEL if this default isn't available on your free tier.
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip() or "gemini-2.5-flash"
+# Used automatically when the primary model returns 429 (quota/rate-limit exceeded).
+GEMINI_FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-2.0-flash").strip()
+
+
+def _parse_gemini_retry_delay(err) -> Optional[float]:
+    """Pull the API-suggested retry delay (seconds) from a Gemini error, if present.
+    Matches RetryInfo (`'retryDelay': '33s'`) or the human text (`retry in 33.8s`)."""
+    s = str(err)
+    m = _re.search(r"retry(?:Delay)?['\":\s]+(?:in\s+)?(\d+(?:\.\d+)?)\s*s", s, _re.IGNORECASE)
+    if m:
+        try:
+            return float(m.group(1))
+        except ValueError:
+            return None
+    return None
+
+
+def _sniff_image_mime(data: bytes) -> str:
+    if data[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return "image/png"
+
+
+_GEMINI_PROMPT = (
+    "You are an OCR table extractor. Extract ALL data from this image as tables. "
+    "Return ONLY JSON of the form "
+    '{"tables": [{"rows": [["cell", "cell"], ["cell", "cell"]]}]}. '
+    "Rules: preserve every row and column; use an empty string for blank cells; "
+    "keep numbers, dates, and text exactly as written (do not reformat); include the "
+    "header row. If a region is key-value text rather than a grid, put each line as a "
+    "single-cell row. Output no commentary, only the JSON."
+)
+
+
+def convert_image_gemini(content: bytes, stem: str, mode: str = "single",
+                         merge_cols: bool = False) -> str:
+    """
+    Image → Excel via Google Gemini (AI Studio, free tier — no credit card).
+    Gemini reads the image and returns table data as JSON, which we map to sheets.
+    Raises CloudOCRUnavailable when the SDK isn't installed, the key is missing, or
+    the API call fails, so the caller can fall back to Tesseract.
+    """
+    if not _gemini_configured():
+        raise CloudOCRUnavailable("Gemini API key (GEMINI_API_KEY) is not configured.")
+    try:
+        from google import genai
+        from google.genai import types
+    except ImportError as e:
+        raise CloudOCRUnavailable(
+            "google-genai is not installed. Run: pip install google-genai"
+        ) from e
+
+    import time as _time
+    client = genai.Client(api_key=GEMINI_API_KEY)
+    contents = [
+        types.Part.from_bytes(data=content, mime_type=_sniff_image_mime(content)),
+        _GEMINI_PROMPT,
+    ]
+    cfg = types.GenerateContentConfig(response_mime_type="application/json")
+
+    # Retry policy (per model), then fall back to the next model on HARD exhaustion:
+    #   • per-minute rate limit (RPM/TPM) or 503/overloaded → transient: wait the
+    #     API-suggested delay (capped) and retry the SAME model. Free-tier 2.5-flash
+    #     is 5 RPM, so bursts trip this — but it clears within the minute.
+    #   • per-day quota (RPD) or "limit: 0" (model not on this tier) → this model is
+    #     done → try the next model.
+    #   • anything else (400/401/403) → permanent → abort (next model fails too).
+    models = []
+    for m in (GEMINI_MODEL, GEMINI_FALLBACK_MODEL):
+        if m and m not in models:
+            models.append(m)
+
+    _WAIT_CAP = 30.0          # never sleep longer than this per wait
+    _MAX_ATTEMPTS = 3         # up to 2 waited retries per model
+
+    raw = None
+    last_err = None
+    for model in models:
+        for attempt in range(_MAX_ATTEMPTS):
+            try:
+                response = client.models.generate_content(
+                    model=model, contents=contents, config=cfg
+                )
+                raw = (response.text or "").strip()
+                log.info("Gemini OCR used model %s", model)
+                break
+            except Exception as e:
+                last_err = e
+                msg = str(e).lower()
+                is_429       = "429" in msg or "resource_exhausted" in msg or "rate limit" in msg
+                is_503       = any(t in msg for t in ("503", "500", "unavailable", "overloaded", "high demand"))
+                is_limit0    = "limit: 0" in msg or "limit:0" in msg
+                is_per_day   = "perday" in msg or "per day" in msg
+                is_per_min   = "perminute" in msg or "per minute" in msg
+                retry_delay  = _parse_gemini_retry_delay(e)
+
+                # Hard exhaustion for this model → move on to the next model.
+                if is_limit0 or (is_429 and is_per_day):
+                    log.warning("Gemini model %s hard-exhausted (daily/limit:0); trying next model.", model)
+                    break
+
+                # Transient: per-minute 429, a 429 with a suggested delay, or 503.
+                if is_503 or (is_429 and (is_per_min or retry_delay is not None)):
+                    if attempt < _MAX_ATTEMPTS - 1:
+                        wait = min(retry_delay if retry_delay is not None else 1.5 * (attempt + 1), _WAIT_CAP)
+                        log.warning("Gemini model %s transient (%s); waiting %.1fs and retrying.",
+                                    model, "429/rate-limit" if is_429 else "503", wait)
+                        _time.sleep(wait)
+                        continue
+                    break                                   # retries exhausted → next model
+
+                # Unknown 429 (no day/min signal, no delay) → treat as this-model-done.
+                if is_429:
+                    log.warning("Gemini model %s rate-limited (unclassified); trying next model.", model)
+                    break
+
+                raise CloudOCRUnavailable(f"Gemini API call failed: {e}") from e
+        if raw is not None:
+            break
+    if raw is None:
+        raise CloudOCRUnavailable(f"Gemini API call failed (all models exhausted): {last_err}")
+
+    # Parse the JSON (tolerate stray code fences if the model added them).
+    import json
+    if raw.startswith("```"):
+        raw = raw.strip("`")
+        raw = raw[raw.find("{"):] if "{" in raw else raw
+    try:
+        data = json.loads(raw)
+    except Exception as e:
+        raise CloudOCRUnavailable(f"Gemini returned unparseable JSON: {e}") from e
+
+    sections: list[tuple[str, list[list[str]]]] = []
+    for idx, table in enumerate(data.get("tables", []) or [], start=1):
+        rows = [
+            [("" if c is None else str(c)).strip() for c in (row or [])]
+            for row in (table.get("rows", []) or [])
+        ]
+        rows = [r for r in rows if any(c for c in r)]
+        if merge_cols:
+            rows = _merge_repeating_cols(rows)
+        if rows:
+            title = sanitize_sheet_name(
+                " ".join(c for c in rows[0] if c.strip()) or f"Table {idx}"
+            )
+            sections.append((title, rows))
+
+    return _cloud_sections_to_workbook(sections, stem, mode, fallback_text=raw)
+
+
+_RAPIDOCR_ENGINE = None   # lazily-initialised singleton (ONNX model load is slow)
+
+def _ocr_words_rapidocr(pil_img):
+    """
+    OCR an image with RapidOCR (a free, local PP-OCR neural model via ONNXRuntime —
+    no card, no quota, no internet).  Returns words in the same shape convert_image's
+    `all_words` uses, or None if RapidOCR isn't installed / finds nothing.  Used as a
+    higher-accuracy fallback for low-confidence (degraded photo) images.
+    """
+    global _RAPIDOCR_ENGINE
+    try:
+        import numpy as _np
+        from rapidocr_onnxruntime import RapidOCR
+    except ImportError:
+        return None
+    try:
+        if _RAPIDOCR_ENGINE is None:
+            _RAPIDOCR_ENGINE = RapidOCR()
+        result, _ = _RAPIDOCR_ENGINE(_np.array(pil_img.convert("RGB")))
+    except Exception as e:
+        log.warning("RapidOCR failed: %s", e)
+        return None
+    if not result:
+        return None
+
+    words = []
+    for item in result:
+        box, text = item[0], item[1]
+        t = (text or "").strip()
+        if not t:
+            continue
+        xs = [p[0] for p in box]
+        ys = [p[1] for p in box]
+        left, right = int(min(xs)), int(max(xs))
+        top, bottom = int(min(ys)), int(max(ys))
+        words.append({
+            "text":   _desplit_glued(t),
+            "left":   left,
+            "top":    top,
+            "right":  right,
+            "width":  max(right - left, 1),
+            "height": max(bottom - top, 1),
+        })
+    return words or None
+
+
+# ── Spreadsheet-screenshot chrome cleanup ──────────────────────────────────────
+# Photos of an Excel/Sheets window also capture the app's own UI: the Name Box
+# ("A26"), the column-letter band ("A B C D …"), and the row-number gutter
+# ("2", "3", …).  OCR folds these into the data — the column-letter band lands as
+# a spurious first row that shoves the first contacts' phones down a row, and the
+# gutter numbers glue onto names ("2 viswa").  These are *not* real data, so we
+# strip them in a final validation pass — but only when we're confident the image
+# is a spreadsheet screenshot, so ordinary photos/scans are never touched.
+_COL_LETTER_CELL_RE = _re.compile(r"^[A-Z]( [A-Z])*$")   # "B", "C D E", "F"
+_NAME_BOX_RE        = _re.compile(r"^[A-Z]{1,3}\d{1,7}$")  # "A26", "AB12"
+_ROW_GUTTER_RE      = _re.compile(r"^(?:\d{1,3}[\s.]+)+(?=\D)")  # leading "2 " / "3 2 " before text
+_PURE_ROWNUM_RE     = _re.compile(r"^\d{1,3}$")            # a lone row number
+_TRAIL_COL_LETTER_RE = _re.compile(r"\s+[A-Z]$")          # name with " H" stuck on
+
+# Only the top few rows carry the header band — bound chrome edits to them so a
+# legitimate single-letter or leading-number cell deeper in the table is safe.
+_CHROME_TOP_ROWS = 3
+
+
+def _looks_like_spreadsheet_screenshot(rows: list[list[str]]) -> bool:
+    """True if the OCR rows carry Excel/Sheets UI chrome (name box / letter band)."""
+    col_letters = 0
+    for row in rows[:_CHROME_TOP_ROWS]:
+        for cell in row:
+            s = cell.strip()
+            if _COL_LETTER_CELL_RE.match(s):
+                col_letters += s.count(" ") + 1   # "C D E" → 3 column letters
+    name_box = False
+    for row in rows[:2]:
+        nonempty = [c.strip() for c in row if c.strip()]
+        if len(nonempty) == 1 and _NAME_BOX_RE.match(nonempty[0]):
+            name_box = True
+    return name_box or col_letters >= 2
+
+
+def _strip_spreadsheet_chrome(rows: list[list[str]]) -> list[list[str]]:
+    """Remove Excel UI chrome (name box, column-letter band, row-number gutter).
+
+    No-op unless the rows look like a spreadsheet screenshot.  Returns a new,
+    chrome-free row list (rows emptied by the cleanup are dropped).
+    """
+    if not _looks_like_spreadsheet_screenshot(rows):
+        return rows
+
+    cleaned: list[list[str]] = []
+    for idx, row in enumerate(rows):
+        # Drop the Name Box artifact: a lone "A26"-style token, rest of row empty.
+        nonempty = [c.strip() for c in row if c.strip()]
+        if len(nonempty) == 1 and _NAME_BOX_RE.match(nonempty[0]):
+            continue
+
+        new = list(row)
+        for ci, cell in enumerate(new):
+            s = cell.strip()
+            # Pure column-letter cells in the header band → blank.
+            if idx < _CHROME_TOP_ROWS and _COL_LETTER_CELL_RE.match(s):
+                new[ci] = ""
+                continue
+            # Row-number gutter lives in the leftmost column only.
+            if ci == 0:
+                if _PURE_ROWNUM_RE.match(s):
+                    new[ci] = ""
+                    continue
+                stripped = _ROW_GUTTER_RE.sub("", s)
+                if stripped != s:
+                    new[ci] = stripped.strip()
+            # A column letter glued onto a name in the header band ("shaki H").
+            if idx < _CHROME_TOP_ROWS and _TRAIL_COL_LETTER_RE.search(new[ci].strip()):
+                new[ci] = _TRAIL_COL_LETTER_RE.sub("", new[ci].strip())
+
+        if any(c.strip() for c in new):
+            cleaned.append(new)
+
+    dropped = len(rows) - len(cleaned)
+    log.info("Spreadsheet chrome detected: stripped UI artifacts (%d row(s) removed).", dropped)
+    return cleaned
+
+
+# A cell that glued a name onto its phone number(s): "pargunan 7981233678",
+# "shyam 8978973222", "ramana reddy 8848436887".  The name part must contain a
+# letter (so a pure two-phone cell like "9980831997 9963393260" is NOT a match),
+# and the trailing part is one or more long digit runs (phone numbers).
+_NAME_PHONE_RE = _re.compile(r"^(.+?)\s+(\d{9,}(?:\s+\d{9,})*)$")
+
+
+def _name_phone_split(cell: str):
+    """Return (name, phones) if the cell is 'name + phone number(s)', else None."""
+    m = _NAME_PHONE_RE.match(cell.strip())
+    if not m:
+        return None
+    name = m.group(1).strip()
+    if not _re.search(r"[A-Za-z]", name):   # the left part must look like a name
+        return None
+    return name, m.group(2).strip()
+
+
+def _split_glued_name_phone_columns(rows: list[list[str]]) -> list[list[str]]:
+    """Split a column that glued names onto phone numbers into two columns.
+
+    When OCR misses the gap between a name column and its phone column, every cell
+    reads as "name 9876543210".  If a column is *predominantly* such cells, split
+    it into a name column followed by a phone column.  Other columns (pure names,
+    pure phones, descriptions) never match the majority test and pass through.
+    """
+    if not rows:
+        return rows
+    ncols = max((len(r) for r in rows), default=0)
+    grid = [list(r) + [""] * (ncols - len(r)) for r in rows]
+
+    new_cols: list[list[str]] = []
+    split_any = False
+    for ci in range(ncols):
+        col = [grid[ri][ci].strip() for ri in range(len(grid))]
+        nonempty = [c for c in col if c]
+        matches = sum(1 for c in nonempty if _name_phone_split(c))
+        # Split only when the column is clearly a glued name+phone column: a strong
+        # majority of its filled cells carry a trailing phone number.
+        if nonempty and matches >= 3 and matches >= 0.6 * len(nonempty):
+            split_any = True
+            names, phones = [], []
+            for c in col:
+                parts = _name_phone_split(c)
+                if parts:
+                    names.append(parts[0])
+                    phones.append(parts[1])
+                else:
+                    names.append(c)
+                    phones.append("")
+            new_cols.append(names)
+            new_cols.append(phones)
+        else:
+            new_cols.append(col)
+
+    if not split_any:
+        return rows
+
+    # Drop any fully-empty trailing columns the split may have exposed.
+    while new_cols and not any(c.strip() for c in new_cols[-1]):
+        new_cols.pop()
+
+    out = [[new_cols[ci][ri] for ci in range(len(new_cols))] for ri in range(len(grid))]
+    log.info("Split a glued name+phone column into separate name/phone columns.")
+    return out
+
+
+# Two long numbers glued into one cell ("9980831997 9963393260") — the signature
+# of a row that absorbed a neighbour's phone because a tilted photo smeared the
+# y-coordinate row grouping. Used to detect (and, after re-grouping, fix) that.
+_TWO_LONG_NUMS_RE = _re.compile(r"\d{9,}\s+\d{9,}")
+
+
+def _count_number_collisions(rows: list[list[str]]) -> int:
+    return sum(1 for r in rows for c in r if _TWO_LONG_NUMS_RE.search(c.strip()))
+
+
+def _group_lines_tilted(words: list[dict], slope: float, y_tol: float) -> list[list[dict]]:
+    """Y-band line grouping (same as the main path) but on a tilt-corrected Y:
+    `cy - left*slope`. slope=0 reproduces the untilted grouping exactly."""
+    def adj(w):
+        return w["top"] + w["height"] / 2 - w["left"] * slope
+
+    sw = sorted(words, key=lambda w: (adj(w), w["left"]))
+    lines: list[list[dict]] = []
+    cur: list[dict] = [sw[0]]
+    cur_a = adj(sw[0])
+    for wd in sw[1:]:
+        a = adj(wd)
+        if abs(a - cur_a) <= y_tol:
+            cur.append(wd)
+            cur_a = sum(adj(w) for w in cur) / len(cur)
+        else:
+            lines.append(sorted(cur, key=lambda w: w["left"]))
+            cur, cur_a = [wd], a
+    lines.append(sorted(cur, key=lambda w: w["left"]))
+    return lines
+
+
+def _refine_tilted_rows(rows: list[list[str]], all_words: list[dict],
+                        img_width: int, y_tol: float) -> list[list[str]]:
+    """Fix row mis-grouping caused by a tilted photo.
+
+    A tilt smears the y-band grouping so a row absorbs the next row's phone number
+    (two numbers land in one cell).  Only when that defect is present, re-group the
+    words at a few tilt angles, re-detect columns, and keep the version that has the
+    FEWEST such collisions (tie-break: higher table score).  Because it triggers
+    only on the defect and must strictly reduce it, straight images are never
+    touched.  Returns the original rows if nothing beats them.
+    """
+    base = _count_number_collisions(rows)
+    if base == 0 or len(all_words) < 12:
+        return rows
+
+    best_rows = rows
+    best_key = (base, -_score_table_rows(rows))
+    for slope in (0.02, 0.035, 0.05):
+        lgs = _group_lines_tilted(all_words, slope, y_tol)
+        for bounds in (_columns_from_left_edges(lgs, img_width),
+                       _detect_columns_from_gaps(lgs, img_width)):
+            if not bounds or len(bounds) <= 2:
+                continue
+            cand = []
+            for ln in lgs:
+                cells = _line_to_cells_fixed(ln, bounds)
+                if any(c.strip() for c in cells):
+                    cand.append(cells)
+            key = (_count_number_collisions(cand), -_score_table_rows(cand))
+            if key < best_key:
+                best_key, best_rows = key, cand
+
+    if best_rows is not rows:
+        log.info("Tilt refinement: number-collisions %d → %d (re-grouped a tilted photo).",
+                 base, best_key[0])
+    return best_rows
+
+
 def convert_image(content: bytes, stem: str, filename: str, merge_cols: bool = False) -> str:
-    """Image (PNG/JPG) → Excel via OCR (pytesseract) with column detection."""
+    """Image (PNG/JPG) → Excel via OCR (pytesseract, or RapidOCR for hard photos)."""
     try:
         import pytesseract
         from PIL import Image
@@ -993,7 +2132,107 @@ def convert_image(content: bytes, stem: str, filename: str, merge_cols: bool = F
         if img.mode not in ("RGB", "L"):
             img = img.convert("RGB")
 
-        data = pytesseract.image_to_data(img, output_type=Output.DICT)
+        # ── Grid detection (jpgtoexcel.com / AWS Textract technique) ─────────
+        # Detect drawn table lines first.  If a grid is found, OCR each cell
+        # individually with PSM 7 (single line) — far more accurate than
+        # whole-image OCR and completely bypasses the coloured-header problem.
+        import cv2 as _cv2
+        import numpy as _np
+
+        _gray_for_grid = _np.array(img.convert("L"))
+        # Case A candidate: full drawn grid → per-cell OCR.  Collected (not
+        # returned early) so it competes with the other strategies on score.
+        _grid_rows = None
+        _grid = _detect_table_grid(_gray_for_grid)
+        if _grid is not None:
+            _col_bounds, _row_bounds = _grid
+            _grid_rows = _extract_cells_from_grid(img, _col_bounds, _row_bounds) or None
+
+        # ── Coloured header band (e.g. purple transaction header) ─────────────
+        # The band's word positions define exact column boundaries — far more
+        # reliable than inferring columns from transaction-row word gaps.
+        _band = _detect_header_band(_gray_for_grid)
+        _header_col_bounds = None
+        _header_labels = None
+        _table_y_start = None
+        if _band is not None:
+            _bt, _bb = _band
+            _hb = _columns_from_header_band(img, _bt, _bb)
+            if _hb is not None:
+                _header_col_bounds, _header_labels = _hb
+                _table_y_start = _bb   # transaction rows start just below the band
+
+        # ── Preprocessing (lesson from professional converters) ───────────────
+        # 1. Scale up small images — Tesseract accuracy drops below ~150 DPI.
+        # 2. Adaptive binarisation: handles dark/coloured header rows (purple,
+        #    green, etc.) and uneven lighting without a second inverted-image pass.
+        # 3. Use LSTM engine (--oem 3) + uniform-block PSM (--psm 6).
+        gray = _np.array(img.convert("L"))
+
+        # Scale up if the image is small
+        if img.width < 1500:
+            scale = max(2, 1500 // img.width)
+            gray  = _cv2.resize(gray, (img.width * scale, img.height * scale),
+                                interpolation=_cv2.INTER_LANCZOS4)
+
+        # Auto-handle light-text-on-dark-background images (e.g. dark-mode
+        # screenshots).  Tesseract reads black-on-white, so we invert the
+        # grayscale when the text is lighter than the background.
+        # Polarity via Otsu: the minority pixel class is the "ink" (text).  If
+        # dark pixels are the MAJORITY, the background is dark → invert.  This
+        # correctly leaves dark-text-on-medium-grey docs (e.g. tinted bank
+        # statements) untouched, unlike a naive mean-brightness threshold.
+        _otsu_thr, _ = _cv2.threshold(gray, 0, 255, _cv2.THRESH_BINARY + _cv2.THRESH_OTSU)
+        if int((gray < _otsu_thr).sum()) >= int((gray >= _otsu_thr).sum()):
+            gray = 255 - gray
+
+        from PIL import Image as _PILImage
+
+        def _mean_conf(r):
+            cs = [int(c) for i, c in enumerate(r["conf"])
+                  if r["text"][i].strip() and int(c) >= 0]
+            return (sum(cs) / len(cs)) if cs else 0.0
+
+        # Adaptive threshold: each 31×31 local region binarised independently
+        bw = _cv2.adaptiveThreshold(
+            gray, 255,
+            _cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            _cv2.THRESH_BINARY, 31, 10,
+        )
+        preprocessed = _PILImage.fromarray(bw)
+        raw = pytesseract.image_to_data(
+            preprocessed, output_type=Output.DICT, config="--oem 3 --psm 6"
+        )
+
+        # Low confidence ⇒ the local adaptive threshold is producing speckle
+        # (typical of low-contrast camera photos of screens).  Retry with a
+        # denoise + global-Otsu pass and keep whichever reads more confidently.
+        # Clean screenshots score 70-95 here and never trigger this, so their
+        # behaviour is unchanged.
+        if _mean_conf(raw) < 55:
+            den = _cv2.fastNlMeansDenoising(gray, None, 10, 7, 21)
+            _, bw2 = _cv2.threshold(den, 0, 255, _cv2.THRESH_BINARY + _cv2.THRESH_OTSU)
+            pre2 = _PILImage.fromarray(bw2)
+            raw2 = pytesseract.image_to_data(
+                pre2, output_type=Output.DICT, config="--oem 3 --psm 6"
+            )
+            if _mean_conf(raw2) > _mean_conf(raw):
+                preprocessed, raw = pre2, raw2
+
+        _tess_conf = _mean_conf(raw)   # used below to decide on the RapidOCR fallback
+
+        scale_x = img.width  / preprocessed.width
+        scale_y = img.height / preprocessed.height
+
+        # Remap coordinates back to original image space
+        data = {
+            "text": raw["text"],
+            "conf": raw["conf"],
+            "left":   [int(v * scale_x) for v in raw["left"]],
+            "top":    [int(v * scale_y) for v in raw["top"]],
+            "width":  [int(v * scale_x) for v in raw["width"]],
+            "height": [int(v * scale_y) for v in raw["height"]],
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"OCR failed: {str(e)}")
 
@@ -1007,8 +2246,14 @@ def convert_image(content: bytes, stem: str, filename: str, merge_cols: bool = F
     for i in range(len(data["text"])):
         text = data["text"][i].strip()
         conf = int(data["conf"][i])
-        if not text or conf <= 20:
+        # Keep every word Tesseract actually emitted (conf >= 0); drop only the
+        # -1 structural markers.  Tesseract confidence is unreliable — it assigns
+        # conf 0-15 to perfectly-correct words (e.g. "CHECK 1249", "SERVICE
+        # CHARGE"), so a conf>20 gate silently DROPS valid table cells.  Garbage
+        # is handled downstream by the best-of-N scorer, not by this gate.
+        if not text or conf < 0:
             continue
+        text = _desplit_glued(text)   # 'POSPURCHASE' → 'POS PURCHASE'
         w = data["width"][i]
         h = data["height"][i]
         all_words.append({
@@ -1019,6 +2264,17 @@ def convert_image(content: bytes, stem: str, filename: str, merge_cols: bool = F
             "width":  w,
             "height": max(h, 1),
         })
+
+    # Low Tesseract confidence ⇒ a degraded photo (e.g. a camera shot of a screen).
+    # Swap in RapidOCR — a free, local neural OCR that reads such images far better —
+    # if it's installed. Clean docs score 70-95 here and keep their tuned Tesseract
+    # output untouched; only the hard photos get the heavier neural engine.
+    if _tess_conf < 65:
+        rapid_words = _ocr_words_rapidocr(img)
+        if rapid_words:
+            log.info("Low Tesseract confidence (%.0f) — using RapidOCR (%d regions).",
+                     _tess_conf, len(rapid_words))
+            all_words = rapid_words
 
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -1050,60 +2306,195 @@ def convert_image(content: bytes, stem: str, filename: str, merge_cols: bool = F
 
     img_width = img.width
 
-    # ── Column detection ─────────────────────────────────────────────────────
-    # 1. Header-keyword based (bank statements etc.)
-    col_boundaries = _find_col_boundaries(line_groups, img_width)
+    # ── Word-based column detection cascade (unchanged logic) ─────────────────
+    # Computes column boundaries from a set of line_groups, ignoring any header
+    # band.  This is the "Case C" detector and is reused as the safe baseline.
+    def _cascade_col_boundaries(lgs):
+        col_boundaries = None
 
-    # 2. Zone histogram: divide width into 50 coarse zones.
-    #    Only runs of ≥ 2 consecutive empty zones count as column separators
-    #    (~img_width/25 px minimum gap).  This avoids splitting on the small
-    #    spaces between individual words within a column.
-    if col_boundaries is None:
-        n_zones  = 50
-        zone_w   = max(1.0, img_width / n_zones)
-        zone_cov = [False] * n_zones
-        for wd in all_words:
-            z0 = int(wd["left"]  / zone_w)
-            z1 = int(wd["right"] / zone_w)
-            for z in range(max(0, z0), min(n_zones, z1 + 1)):
-                zone_cov[z] = True
+        # 1. Header-keyword based (bank statements etc.)
+        col_boundaries = _find_col_boundaries(lgs, img_width)
 
-        min_gap_zones = 2          # at least 2 empty zones = real column gap
-        histo_bounds  = [0]
-        z = 0
-        while z < n_zones:
-            if not zone_cov[z]:
-                gap_start = z
-                while z < n_zones and not zone_cov[z]:
+        # 2. Zone histogram: divide width into 50 coarse zones.
+        if col_boundaries is None:
+            n_zones  = 50
+            zone_w   = max(1.0, img_width / n_zones)
+            zone_cov = [False] * n_zones
+            for wd in all_words:
+                z0 = int(wd["left"]  / zone_w)
+                z1 = int(wd["right"] / zone_w)
+                for z in range(max(0, z0), min(n_zones, z1 + 1)):
+                    zone_cov[z] = True
+            min_gap_zones = 2
+            histo_bounds  = [0]
+            z = 0
+            while z < n_zones:
+                if not zone_cov[z]:
+                    gap_start = z
+                    while z < n_zones and not zone_cov[z]:
+                        z += 1
+                    gap_end = z
+                    if gap_end - gap_start >= min_gap_zones:
+                        mid_px = int(((gap_start + gap_end) / 2) * zone_w)
+                        histo_bounds.append(mid_px)
+                else:
                     z += 1
-                gap_end = z
-                if gap_end - gap_start >= min_gap_zones:
-                    mid_px = int(((gap_start + gap_end) / 2) * zone_w)
-                    histo_bounds.append(mid_px)
-            else:
-                z += 1
-        histo_bounds.append(img_width)
-        if len(histo_bounds) > 2:
-            col_boundaries = histo_bounds
+            histo_bounds.append(img_width)
+            if len(histo_bounds) > 2:
+                col_boundaries = histo_bounds
 
-    # 3. Gap-distribution fallback
-    if col_boundaries is None:
-        col_boundaries = _detect_columns_from_gaps(line_groups, img_width)
+        # 3. Right-edge clustering (financial tables right-align amounts).
+        if col_boundaries is None:
+            _NUM_CLEAN_RE = _re.compile(r'[\$\d,\.]+')
+            _NUM_RE = _re.compile(r'^\$?[\d,]+\.\d{2}$')
 
-    # ── Render rows ──────────────────────────────────────────────────────────
-    if col_boundaries and len(col_boundaries) > 2:
-        rows = []
-        for line in line_groups:
-            cells = _line_to_cells_fixed(line, col_boundaries)
+            def _clean_num(text: str) -> str:
+                m = _NUM_CLEAN_RE.search(text)
+                return m.group(0).rstrip('.') if m else ""
+
+            right_edges: list[int] = []
+            for line in lgs:
+                for wd in line:
+                    if _NUM_RE.match(_clean_num(wd["text"])):
+                        right_edges.append(wd["right"])
+            if len(right_edges) >= 4:
+                right_edges.sort()
+                re_clusters: list[list[int]] = [[right_edges[0]]]
+                for r in right_edges[1:]:
+                    if r - re_clusters[-1][-1] <= 15:
+                        re_clusters[-1].append(r)
+                    else:
+                        re_clusters.append([r])
+                sig = [c for c in re_clusters if len(c) >= 2]
+                if len(sig) >= 2:
+                    centres = sorted(sum(c) // len(c) for c in sig)
+                    first_num_left = min(
+                        (wd["left"] for line in lgs for wd in line
+                         if _NUM_RE.match(_clean_num(wd["text"]))),
+                        default=centres[0] - 50,
+                    )
+                    bounds = [0, max(5, first_num_left - 5)]
+                    for i in range(len(centres) - 1):
+                        bounds.append((centres[i] + centres[i + 1]) // 2)
+                    bounds.append(img_width)
+                    if len(bounds) >= 4:
+                        col_boundaries = bounds
+
+        # 4. Gap-distribution fallback
+        if col_boundaries is None:
+            col_boundaries = _detect_columns_from_gaps(lgs, img_width)
+
+        return col_boundaries
+
+    # ── Render rows from given boundaries (unchanged logic) ───────────────────
+    # table_y_start: if set, rows above it are emitted as plain metadata text
+    # rows above the table (used by the coloured-header-band strategy).
+    def _render_rows(col_boundaries, header_labels, table_y_start):
+        meta_lgs = []
+        table_lgs = line_groups
+        if table_y_start is not None:
+            meta_lgs  = [lg for lg in line_groups if lg[0]["top"] <  table_y_start]
+            table_lgs = [lg for lg in line_groups if lg[0]["top"] >= table_y_start]
+
+        if col_boundaries and len(col_boundaries) > 2:
+            rows = []
+            if header_labels and len(header_labels) == len(col_boundaries) - 1:
+                rows.append(list(header_labels))
+            for line in table_lgs:
+                cells = _line_to_cells_fixed(line, col_boundaries)
+                if any(c.strip() for c in cells):
+                    rows.append(cells)
+            if not rows:
+                rows = [["Result"], ["No structured content detected."]]
+        else:
+            rows = [["Line #", "Extracted Text"]]
+            for i, line in enumerate(table_lgs, start=1):
+                text = " ".join(wd["text"] for wd in line)
+                rows.append([i, text])
+
+        if meta_lgs:
+            meta_rows = []
+            for line in meta_lgs:
+                text = " ".join(wd["text"] for wd in line).strip()
+                if text:
+                    meta_rows.append([text])
+            rows = meta_rows + [[""]] + rows
+        return rows
+
+    # ── Collect candidate results from each applicable strategy ───────────────
+    candidates: list[tuple[str, list]] = []
+
+    # Case A: drawn grid
+    if _grid_rows:
+        candidates.append(("grid", _grid_rows))
+
+    # Case B: coloured header band gives exact column boundaries
+    if _header_col_bounds is not None:
+        candidates.append((
+            "header_band",
+            _render_rows(_header_col_bounds, _header_labels, _table_y_start),
+        ))
+
+    # Case C: word-based cascade (always present — the safe baseline)
+    candidates.append(("word_based", _render_rows(_cascade_col_boundaries(line_groups), None, None)))
+
+    # Case D: left-edge clustering (best for left-aligned multi-column tables)
+    _left_bounds = _columns_from_left_edges(line_groups, img_width)
+    if _left_bounds is not None:
+        candidates.append(("left_aligned", _render_rows(_left_bounds, None, None)))
+
+    # Case E: faint vertical rules → columns (bordered light-bg statements, e.g.
+    # SBI). Uses the ruled column x-boundaries with the good whole-image OCR.
+    # Also recover the table's header row (which full-page OCR usually skips) by
+    # OCRing the header band on its own, and place metadata above it.
+    _ruled_bounds = _columns_from_ruled_lines(_gray_for_grid, img_width)
+    if _ruled_bounds is not None:
+        _ruled_hdr = _header_row_for_ruled(img, _gray_for_grid, _ruled_bounds)
+        _hdr_cells, _hdr_top = _ruled_hdr if _ruled_hdr else (None, None)
+        # Render every line into the ruled columns; insert the recovered header
+        # row at the table boundary (full-page OCR skips it, so no line_group
+        # exists there).  Metadata stays rendered in columns (scores best).
+        _rrows: list[list[str]] = []
+        _hdr_done = False
+        for ln in line_groups:
+            if _hdr_cells and not _hdr_done and ln[0]["top"] >= _hdr_top:
+                _rrows.append(list(_hdr_cells))
+                _hdr_done = True
+            cells = _line_to_cells_fixed(ln, _ruled_bounds)
             if any(c.strip() for c in cells):
-                rows.append(cells)
-        if not rows:
-            rows = [["Result"], ["No structured content detected."]]
-    else:
-        rows = [["Line #", "Extracted Text"]]
-        for i, line in enumerate(line_groups, start=1):
-            text = " ".join(wd["text"] for wd in line)
-            rows.append([i, text])
+                _rrows.append(cells)
+        if _hdr_cells and not _hdr_done:
+            _rrows.append(list(_hdr_cells))
+        candidates.append(("ruled_columns", _rrows))
+
+    # ── Pick the best-scoring candidate ───────────────────────────────────────
+    # Confidence priors: a detected coloured-header band is a strong image-type
+    # signal, so it gets a bonus (it also legitimately splits metadata text rows
+    # above the table, which would otherwise look "inconsistent" to the scorer).
+    _CONF_BONUS = {"header_band": 2.0}
+
+    def _cand_score(c):
+        return _score_table_rows(c[1]) + _CONF_BONUS.get(c[0], 0.0)
+
+    best_name, rows = max(candidates, key=_cand_score)
+    log.info(
+        "Image strategy scores: %s → chose '%s'",
+        {n: round(_cand_score((n, r)), 2) for n, r in candidates},
+        best_name,
+    )
+
+    # Tilt refinement: if the chosen rows glued two phone numbers into one cell,
+    # the photo is tilted enough to have smeared the row grouping — re-group at a
+    # few tilt angles and keep the cleanest. No-op unless that defect is present.
+    rows = _refine_tilted_rows(rows, all_words, img_width, y_tol)
+
+    # Final validation pass: drop Excel UI chrome when the image is a screenshot
+    # of a spreadsheet (no-op for ordinary photos/scans).
+    rows = _strip_spreadsheet_chrome(rows)
+
+    # Split a column where OCR glued names onto their phone numbers (no-op unless a
+    # column is predominantly "name 9876543210").
+    rows = _split_glued_name_phone_columns(rows)
 
     if merge_cols:
         rows = _merge_repeating_cols(rows)
@@ -1119,8 +2510,15 @@ async def root():
     return {"message": "DocToExcel API is running. POST /api/convert to convert files."}
 
 
+@app.get("/api/cloud-ocr-status")
+async def cloud_ocr_status():
+    """Which cloud OCR engine is configured server-side ('gemini' | 'azure' | null).
+    Used by the UI to show the admin-mode 'AI OCR (cloud)' toggle's real availability."""
+    return {"engine": _cloud_ocr_engine()}
+
+
 @app.post("/api/convert")
-async def convert_file(file: UploadFile = File(...), mode: str = Form("single"), password: str = Form(""), merge_cols: str = Form("false")):
+async def convert_file(file: UploadFile = File(...), mode: str = Form("single"), password: str = Form(""), merge_cols: str = Form("false"), use_azure: str = Form("false")):
     """
     Accept an uploaded file and convert it to Excel.
     mode: 'separate' (default) = one sheet per table/section; 'single' = all in one sheet.
@@ -1161,8 +2559,38 @@ async def convert_file(file: UploadFile = File(...), mode: str = Form("single"),
             msg = f'"{original_name}" converted! Tables and text have been extracted to Excel.'
         elif ext in (".png", ".jpg", ".jpeg"):
             do_merge = merge_cols.lower() == "true"
-            output_filename = convert_image(content, stem, original_name, merge_cols=do_merge)
-            msg = f'"{original_name}" processed via OCR. Extracted text has been placed in the Excel file.'
+            want_cloud = use_azure.lower() == "true"   # admin "AI OCR (cloud)" toggle
+            output_filename = None
+            cloud_err = None                            # reason the cloud attempt failed
+            engine = _cloud_ocr_engine() if want_cloud else None
+            if engine == "gemini":
+                try:
+                    output_filename = convert_image_gemini(content, stem, mode=mode, merge_cols=do_merge)
+                    msg = f'"{original_name}" converted via Google Gemini.'
+                except CloudOCRUnavailable as e:
+                    cloud_err = str(e)
+                    log.warning("Gemini path unavailable, falling back to Tesseract: %s", e)
+            elif engine == "azure":
+                try:
+                    output_filename = convert_image_azure(content, stem, mode=mode, merge_cols=do_merge)
+                    msg = f'"{original_name}" converted via Azure Document Intelligence.'
+                except CloudOCRUnavailable as e:
+                    cloud_err = str(e)
+                    log.warning("Azure path unavailable, falling back to Tesseract: %s", e)
+            if output_filename is None:
+                output_filename = convert_image(content, stem, original_name, merge_cols=do_merge)
+                if not want_cloud:
+                    msg = f'"{original_name}" processed via OCR. Extracted text has been placed in the Excel file.'
+                elif engine is None:
+                    msg = (f'"{original_name}" processed via Tesseract OCR '
+                           f'(no cloud engine configured — see README).')
+                elif cloud_err and any(t in cloud_err.lower()
+                                       for t in ("429", "quota", "limit: 0", "resource_exhausted", "rate limit")):
+                    msg = (f'"{original_name}" processed via Tesseract OCR '
+                           f"(cloud OCR daily quota reached — try again later).")
+                else:
+                    msg = (f'"{original_name}" processed via Tesseract OCR '
+                           f'(cloud OCR temporarily unavailable).')
         else:
             raise HTTPException(status_code=400, detail=f"Unsupported file type: {ext}")
 
@@ -1172,9 +2600,12 @@ async def convert_file(file: UploadFile = File(...), mode: str = Form("single"),
         log.error("Conversion error:\n%s", traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Conversion failed: {str(e)}")
 
+    # Keep the engine/detail in the server log, but show the user a single clean,
+    # branded message regardless of which converter/engine ran.
+    log.info("Conversion result: %s", msg)
     return JSONResponse({
         "output_filename": output_filename,
-        "message": msg,
+        "message": "Converted by MSExcelConverter",
     })
 
 

@@ -38,10 +38,10 @@ function WelcomeCard() {
     <div className="welcome-card">
       <div className="welcome-logo">
         <span className="logo-icon">⚡</span>
-        <h1>DocToExcel</h1>
+        <h1>MSExcelConverter</h1>
       </div>
       <p className="welcome-subtitle">
-        Upload any document and I'll convert it to an Excel spreadsheet instantly.
+        Any doc to EXCEL converter — upload a file and I'll turn it into a spreadsheet instantly.
       </p>
       <div className="supported-formats">
         <p className="formats-title">Supported formats</p>
@@ -70,9 +70,13 @@ function MessageBubble({ msg, passwordInput, setPasswordInput, submitPassword, p
       <div className={`bubble ${isUser ? 'bubble--user' : 'bubble--bot'}`}>
         {msg.type === 'file-upload' && (
           <div className="file-preview">
-            <span className="file-preview__icon">
-              {FILE_ICONS[getFileExt(msg.fileName)] || '📁'}
-            </span>
+            {msg.thumbnailUrl ? (
+              <img className="file-preview__thumb" src={msg.thumbnailUrl} alt={msg.fileName} />
+            ) : (
+              <span className="file-preview__icon">
+                {FILE_ICONS[getFileExt(msg.fileName)] || '📁'}
+              </span>
+            )}
             <div className="file-preview__info">
               <span className="file-preview__name">{msg.fileName}</span>
               <span className="file-preview__size">{msg.fileSize}</span>
@@ -82,7 +86,10 @@ function MessageBubble({ msg, passwordInput, setPasswordInput, submitPassword, p
         {msg.type === 'converting' && (
           <div className="converting-msg">
             <div className="spinner" />
-            <span>{msg.text}</span>
+            <div className="converting-msg__text">
+              <span>{msg.text}</span>
+              {msg.subtext && <span className="converting-hint">{msg.subtext}</span>}
+            </div>
           </div>
         )}
         {msg.type === 'success' && (
@@ -156,6 +163,9 @@ export default function App() {
   const [isConverting, setIsConverting] = useState(false)
   const [sheetMode, setSheetMode] = useState('single') // 'single' | 'separate'
   const [mergeImageCols, setMergeImageCols] = useState(false)
+  const [adminMode, setAdminMode] = useState(false)      // toggled by Ctrl+M+S
+  const [useAzure, setUseAzure] = useState(false)         // admin-only: Azure OCR
+  const [cloudEngine, setCloudEngine] = useState(undefined) // undefined=unknown, 'gemini'|'azure'|null
   const [selectedExt, setSelectedExt] = useState('')    // extension of last selected file
   const [pendingFile, setPendingFile] = useState(null)   // file awaiting password
   const [passwordInput, setPasswordInput] = useState('')
@@ -188,6 +198,42 @@ export default function App() {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages])
 
+  // Admin-mode toggle: hold Ctrl and press M + S together (Ctrl+M+S).
+  useEffect(() => {
+    const down = new Set()
+    const onKeyDown = (e) => {
+      const k = e.key.toLowerCase()
+      if (k === 'm' || k === 's') down.add(k)
+      if (e.ctrlKey && down.has('m') && down.has('s')) {
+        e.preventDefault()           // Ctrl+S would otherwise trigger browser-save
+        setAdminMode(prev => !prev)
+        down.clear()
+      }
+    }
+    const onKeyUp = (e) => { down.delete(e.key.toLowerCase()) }
+    const clear = () => down.clear()
+    window.addEventListener('keydown', onKeyDown)
+    window.addEventListener('keyup', onKeyUp)
+    window.addEventListener('blur', clear)
+    return () => {
+      window.removeEventListener('keydown', onKeyDown)
+      window.removeEventListener('keyup', onKeyUp)
+      window.removeEventListener('blur', clear)
+    }
+  }, [])
+
+  // Leaving admin mode disables the Azure option so it can't be sent inadvertently.
+  // Entering admin mode checks whether Azure is actually configured on the server.
+  useEffect(() => {
+    if (!adminMode) {
+      if (useAzure) setUseAzure(false)
+      return
+    }
+    axios.get(`${BACKEND_URL}/api/cloud-ocr-status`)
+      .then(res => setCloudEngine(res.data?.engine ?? null))
+      .catch(() => setCloudEngine(null))
+  }, [adminMode]) // eslint-disable-line react-hooks/exhaustive-deps
+
   const handleFile = useCallback(async (file, mode = sheetMode, password = '') => {
     if (!file) return
 
@@ -210,12 +256,15 @@ export default function App() {
 
     setIsConverting(true)
 
-    // User bubble showing the uploaded file
+    const isImage = ['png', 'jpg', 'jpeg'].includes(ext)
+
+    // User bubble showing the uploaded file (with a thumbnail for images)
     addMessage({
       role: 'user',
       type: 'file-upload',
       fileName: file.name,
       fileSize: formatBytes(file.size),
+      thumbnailUrl: isImage ? URL.createObjectURL(file) : null,
     })
 
     // Bot "converting" bubble
@@ -223,6 +272,7 @@ export default function App() {
       role: 'bot',
       type: 'converting',
       text: `Converting ${file.name}...`,
+      subtext: isImage ? 'Reading the image — the first AI pass can take a few seconds…' : null,
     })
 
     try {
@@ -231,10 +281,11 @@ export default function App() {
       formData.append('mode', mode)
       if (password) formData.append('password', password)
       formData.append('merge_cols', mergeImageCols ? 'true' : 'false')
+      formData.append('use_azure', (adminMode && useAzure) ? 'true' : 'false')
 
       const res = await axios.post(`${BACKEND_URL}/api/convert`, formData, {
         headers: { 'Content-Type': 'multipart/form-data' },
-        timeout: 120000,
+        timeout: 180000,  // headroom for cloud-OCR retry/backoff waits
       })
 
       const { output_filename, message } = res.data
@@ -242,7 +293,7 @@ export default function App() {
 
       replaceLastBotMessage({
         type: 'success',
-        text: message || `Successfully converted "${file.name}" to Excel!`,
+        text: message || 'Converted by MSExcelConverter',
         downloadUrl,
         downloadName: output_filename,
       })
@@ -270,7 +321,7 @@ export default function App() {
     } finally {
       setIsConverting(false)
     }
-  }, [sheetMode])
+  }, [sheetMode, mergeImageCols, adminMode, useAzure])
 
   // Drag & Drop on the whole window
   useEffect(() => {
@@ -315,6 +366,15 @@ export default function App() {
     handleFile(file, sheetMode, pwd)
   }
 
+  const startNewConversion = () => {
+    if (isConverting) return
+    // Release any image-thumbnail object URLs before clearing.
+    messages.forEach(m => { if (m.thumbnailUrl) URL.revokeObjectURL(m.thumbnailUrl) })
+    setMessages([])
+    setPendingFile(null)
+    setPasswordInput('')
+  }
+
   const showWelcome = messages.length === 0
 
   return (
@@ -323,9 +383,25 @@ export default function App() {
       <header className="header">
         <div className="header__brand">
           <span className="header__icon">⚡</span>
-          <span className="header__title">DocToExcel</span>
+          <div className="header__titles">
+            <span className="header__title">MSExcelConverter</span>
+            <span className="header__subtitle">Any doc to EXCEL converter</span>
+          </div>
         </div>
-        <span className="header__badge">AI Converter</span>
+        <div className="header__badges">
+          {messages.length > 0 && (
+            <button
+              className="header__newbtn"
+              onClick={startNewConversion}
+              disabled={isConverting}
+              title="Clear and start a new conversion"
+            >
+              + New
+            </button>
+          )}
+          {adminMode && <span className="header__badge header__badge--admin">🔓 ADMIN</span>}
+          <span className="header__badge">AI Converter</span>
+        </div>
       </header>
 
       {/* Drag overlay */}
@@ -397,6 +473,36 @@ export default function App() {
             </label>
             <span className="options-bar__info">ℹ️ Only applied to PNG / JPG files</span>
           </div>
+
+          {/* Admin-only: cloud AI OCR engine (revealed via Ctrl+M+S) */}
+          {adminMode && (
+            <div className="options-bar__group options-bar__group--admin">
+              <span className="options-bar__label">Admin · OCR engine</span>
+              <label className="merge-cols-label" title="Use a cloud AI engine (Google Gemini or Azure Document Intelligence) for image conversion — much higher accuracy and native table structure. Falls back to Tesseract if no cloud engine is configured on the server.">
+                <input
+                  type="checkbox"
+                  checked={useAzure}
+                  onChange={e => setUseAzure(e.target.checked)}
+                  disabled={isConverting}
+                />
+                <span>AI OCR (cloud)</span>
+              </label>
+              {cloudEngine === 'gemini' && (
+                <span className="options-bar__info azure-status azure-status--ok">✓ Gemini ready</span>
+              )}
+              {cloudEngine === 'azure' && (
+                <span className="options-bar__info azure-status azure-status--ok">✓ Azure ready</span>
+              )}
+              {cloudEngine === null && (
+                <span className="options-bar__info azure-status azure-status--warn">
+                  ⚠ Not configured — will use Tesseract (see README)
+                </span>
+              )}
+              {cloudEngine === undefined && (
+                <span className="options-bar__info">🔓 Admin mode · PNG / JPG only</span>
+              )}
+            </div>
+          )}
         </div>
       </div>
 
