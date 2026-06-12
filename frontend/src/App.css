@@ -80,11 +80,53 @@ html, body, #root {
   filter: drop-shadow(0 0 6px var(--accent));
 }
 
+.header__titles {
+  display: flex;
+  flex-direction: column;
+  line-height: 1.15;
+}
+
 .header__title {
   font-size: 18px;
   font-weight: 700;
   letter-spacing: -0.3px;
   color: var(--text);
+}
+
+.header__subtitle {
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.2px;
+  color: var(--text-muted);
+}
+
+.header__badges {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.header__newbtn {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-muted);
+  background: transparent;
+  border: 1px solid var(--border);
+  padding: 4px 11px;
+  border-radius: 20px;
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s, background 0.15s;
+}
+
+.header__newbtn:hover:not(:disabled) {
+  color: var(--accent);
+  border-color: rgba(0, 200, 150, 0.4);
+  background: var(--accent-glow);
+}
+
+.header__newbtn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
 }
 
 .header__badge {
@@ -97,6 +139,24 @@ html, body, #root {
   border: 1px solid rgba(0, 200, 150, 0.3);
   padding: 3px 10px;
   border-radius: 20px;
+}
+
+.header__badge--admin {
+  color: #f59e0b;
+  background: rgba(245, 158, 11, 0.12);
+  border-color: rgba(245, 158, 11, 0.4);
+}
+
+.options-bar__group--admin .options-bar__label {
+  color: #f59e0b;
+}
+
+.azure-status--ok {
+  color: var(--accent);
+}
+
+.azure-status--warn {
+  color: #f59e0b;
 }
 
 /* ── Messages Area ──────────────────────────────────────── */
@@ -310,6 +370,15 @@ html, body, #root {
   flex-shrink: 0;
 }
 
+.file-preview__thumb {
+  width: 44px;
+  height: 44px;
+  object-fit: cover;
+  border-radius: 8px;
+  flex-shrink: 0;
+  border: 1px solid var(--border);
+}
+
 .file-preview__info {
   display: flex;
   flex-direction: column;
@@ -333,6 +402,17 @@ html, body, #root {
   display: flex;
   align-items: center;
   gap: 12px;
+}
+
+.converting-msg__text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.converting-hint {
+  font-size: 11px;
+  color: var(--text-muted);
 }
 
 .spinner {
