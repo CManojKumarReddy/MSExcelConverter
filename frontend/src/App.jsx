@@ -1,7 +1,9 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react'
 import axios from 'axios'
 
-const BACKEND_URL = 'http://localhost:8000'
+// Relative base: in dev, Vite proxies /api/* to the backend (see vite.config.js);
+// in production the FastAPI server serves this built app, so /api/* is same-origin.
+const BACKEND_URL = ''
 
 const FILE_ICONS = {
   pdf:  '📄',
@@ -58,7 +60,7 @@ function WelcomeCard() {
   )
 }
 
-function MessageBubble({ msg, passwordInput, setPasswordInput, submitPassword, passwordInputRef }) {
+function MessageBubble({ msg, passwordInput, setPasswordInput, submitPassword, passwordInputRef, onCancel }) {
   const isUser = msg.role === 'user'
   const isBot  = msg.role === 'bot'
 
@@ -90,6 +92,15 @@ function MessageBubble({ msg, passwordInput, setPasswordInput, submitPassword, p
               <span>{msg.text}</span>
               {msg.subtext && <span className="converting-hint">{msg.subtext}</span>}
             </div>
+            {msg.cancellable && (
+              <button
+                className="cancel-btn"
+                onClick={() => onCancel?.(msg.jobId)}
+                title="Remove this conversion from the queue"
+              >
+                Cancel
+              </button>
+            )}
           </div>
         )}
         {msg.type === 'success' && (
@@ -157,6 +168,94 @@ function TypingIndicator() {
   )
 }
 
+/* Inline icons — crisp at any size, themeable via currentColor. */
+const LinkedInIcon = () => (
+  <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" aria-hidden="true">
+    <path d="M20.45 20.45h-3.56v-5.57c0-1.33-.03-3.04-1.85-3.04-1.85 0-2.14 1.45-2.14 2.94v5.67H9.35V9h3.41v1.56h.05c.48-.9 1.64-1.85 3.37-1.85 3.6 0 4.27 2.37 4.27 5.46v6.28zM5.34 7.43a2.06 2.06 0 1 1 0-4.13 2.06 2.06 0 0 1 0 4.13zM7.12 20.45H3.56V9h3.56v11.45zM22.22 0H1.77C.79 0 0 .77 0 1.73v20.54C0 23.22.79 24 1.77 24h20.45c.98 0 1.78-.78 1.78-1.73V1.73C24 .77 23.2 0 22.22 0z"/>
+  </svg>
+)
+const MailIcon = () => (
+  <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+    <rect x="2" y="4" width="20" height="16" rx="2" /><path d="m22 7-10 6L2 7" />
+  </svg>
+)
+const PhoneIcon = () => (
+  <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+    <path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.13.96.36 1.9.7 2.81a2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.9.34 1.85.57 2.81.7A2 2 0 0 1 22 16.92z" />
+  </svg>
+)
+
+function AboutModal({ onClose }) {
+  useEffect(() => {
+    const onKey = (e) => { if (e.key === 'Escape') onClose() }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [onClose])
+
+  const year = new Date().getFullYear()
+
+  return (
+    <div className="about-overlay" onClick={onClose}>
+      <div
+        className="about-modal"
+        onClick={e => e.stopPropagation()}
+        role="dialog"
+        aria-modal="true"
+        aria-label="About MSExcelConverter"
+      >
+        <button className="about-close" onClick={onClose} aria-label="Close">×</button>
+
+        <div className="about-hero">
+          <div className="about-logo">⚡</div>
+          <h2 className="about-title">MSExcelConverter</h2>
+          <p className="about-tagline">
+            Turn any document into a clean Excel spreadsheet — PDFs, Word docs,
+            images, CSVs and more, in seconds.
+          </p>
+        </div>
+
+        <div className="about-section">
+          <span className="about-section__label">Get in touch</span>
+
+          <a
+            className="about-card about-card--link"
+            href="https://www.linkedin.com/in/ms-solutions-89b883414/"
+            target="_blank"
+            rel="noreferrer"
+          >
+            <span className="about-card__icon about-card__icon--linkedin"><LinkedInIcon /></span>
+            <div className="about-card__body">
+              <span className="about-card__title">LinkedIn</span>
+              <span className="about-card__value">MS Solutions</span>
+            </div>
+            <span className="about-card__arrow" aria-hidden="true">↗</span>
+          </a>
+
+          <a className="about-card about-card--link" href="mailto:msexelconverter@gmail.com">
+            <span className="about-card__icon about-card__icon--mail"><MailIcon /></span>
+            <div className="about-card__body">
+              <span className="about-card__title">Email</span>
+              <span className="about-card__value">msexelconverter@gmail.com</span>
+            </div>
+            <span className="about-card__arrow" aria-hidden="true">↗</span>
+          </a>
+
+          <div className="about-card">
+            <span className="about-card__icon about-card__icon--phone"><PhoneIcon /></span>
+            <div className="about-card__body">
+              <span className="about-card__title">Phone</span>
+              <a className="about-card__value about-card__value--link" href="tel:+919966170117">+91 99661 70117</a>
+              <a className="about-card__value about-card__value--link" href="tel:+918374311097">+91 83743 11097</a>
+            </div>
+          </div>
+        </div>
+
+        <div className="about-footer">© {year} MSExcelConverter · Any doc to EXCEL</div>
+      </div>
+    </div>
+  )
+}
+
 export default function App() {
   const [messages, setMessages] = useState([])
   const [isDragging, setIsDragging] = useState(false)
@@ -164,6 +263,7 @@ export default function App() {
   const [sheetMode, setSheetMode] = useState('single') // 'single' | 'separate'
   const [mergeImageCols, setMergeImageCols] = useState(false)
   const [adminMode, setAdminMode] = useState(false)      // toggled by Ctrl+M+S
+  const [showAbout, setShowAbout] = useState(false)      // About modal visibility
   const [useAzure, setUseAzure] = useState(false)         // admin-only: Azure OCR
   const [cloudEngine, setCloudEngine] = useState(undefined) // undefined=unknown, 'gemini'|'azure'|null
   const [selectedExt, setSelectedExt] = useState('')    // extension of last selected file
@@ -173,8 +273,11 @@ export default function App() {
   const messagesEndRef = useRef(null)
   const dropZoneRef = useRef(null)
   const passwordInputRef = useRef(null)
+  const activeJobRef = useRef(null)   // { jobId, cancelled } for the in-flight conversion
 
   const now = () => new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms))
 
   const addMessage = (msg) => {
     setMessages(prev => [...prev, { id: Date.now() + Math.random(), ...msg, time: now() }])
@@ -283,45 +386,118 @@ export default function App() {
       formData.append('merge_cols', mergeImageCols ? 'true' : 'false')
       formData.append('use_azure', (adminMode && useAzure) ? 'true' : 'false')
 
+      // Enqueue the conversion — returns immediately with a job id.
       const res = await axios.post(`${BACKEND_URL}/api/convert`, formData, {
         headers: { 'Content-Type': 'multipart/form-data' },
-        timeout: 180000,  // headroom for cloud-OCR retry/backoff waits
+        timeout: 60000,
       })
+      const jobId = res.data.job_id
+      activeJobRef.current = { jobId, cancelled: false }
 
-      const { output_filename, message } = res.data
-      const downloadUrl = `${BACKEND_URL}/api/download/${output_filename}`
+      // Poll for status until the job leaves the queue / finishes.
+      const result = await pollJob(jobId, file, isImage)
 
-      replaceLastBotMessage({
-        type: 'success',
-        text: message || 'Converted by MSExcelConverter',
-        downloadUrl,
-        downloadName: output_filename,
-      })
-    } catch (err) {
-      if (err.response?.status === 423) {
-        // PDF is password-protected — ask the user
+      if (result?.cancelled) return  // cancel handler already updated the UI
+
+      if (result.status === 'done') {
+        const { output_filename, message } = result
+        const downloadUrl = `${BACKEND_URL}/api/download/${output_filename}`
+        replaceLastBotMessage({
+          type: 'success',
+          text: message || 'Converted by MSExcelConverter',
+          downloadUrl,
+          downloadName: output_filename,
+        })
+      } else if (result.status === 'password_required') {
+        // PDF is password-protected — ask the user, then resubmit as a new job.
         setPendingFile(file)
         setPasswordInput('')
         replaceLastBotMessage({
           type: 'password-prompt',
-          text: password
+          text: result.password_provided
             ? 'Incorrect password. Please try again:'
             : 'This PDF is password-protected. Please enter the password:',
         })
         setTimeout(() => passwordInputRef.current?.focus(), 100)
+      } else if (result.status === 'cancelled') {
+        replaceLastBotMessage({ type: 'error', text: 'Conversion was cancelled.' })
       } else {
-        let errText = 'Something went wrong during conversion. Please try again.'
-        if (err.response?.data?.detail) {
-          errText = err.response.data.detail
-        } else if (err.code === 'ECONNREFUSED' || err.code === 'ERR_NETWORK') {
-          errText = 'Cannot reach the backend server. Make sure the Python FastAPI server is running on port 8000.'
-        }
-        replaceLastBotMessage({ type: 'error', text: errText })
+        replaceLastBotMessage({
+          type: 'error',
+          text: result.detail || 'Something went wrong during conversion. Please try again.',
+        })
       }
+    } catch (err) {
+      let errText = 'Something went wrong during conversion. Please try again.'
+      if (err.response?.data?.detail) {
+        errText = err.response.data.detail
+      } else if (err.code === 'ECONNREFUSED' || err.code === 'ERR_NETWORK') {
+        errText = 'Cannot reach the backend server. Make sure the Python FastAPI server is running on port 8000.'
+      }
+      replaceLastBotMessage({ type: 'error', text: errText })
     } finally {
+      activeJobRef.current = null
       setIsConverting(false)
     }
   }, [sheetMode, mergeImageCols, adminMode, useAzure])
+
+  // Poll a job's status, updating the "converting" bubble (queue position +
+  // cancel button while queued). Resolves with the final status payload, or
+  // { cancelled: true } if the user cancelled mid-wait.
+  const pollJob = useCallback(async (jobId, file, isImage) => {
+    while (true) {
+      if (activeJobRef.current?.cancelled) return { cancelled: true }
+
+      let data
+      try {
+        const res = await axios.get(`${BACKEND_URL}/api/convert/${jobId}`, { timeout: 30000 })
+        data = res.data
+      } catch (err) {
+        if (err.response?.status === 404) {
+          return { status: 'error', detail: 'This conversion expired. Please try again.' }
+        }
+        throw err
+      }
+
+      if (data.status === 'queued') {
+        const pos = data.position || 0
+        replaceLastBotMessage({
+          type: 'converting',
+          text: pos > 0
+            ? `Waiting in queue — ${pos} conversion${pos > 1 ? 's' : ''} ahead of you…`
+            : 'Next in line — starting shortly…',
+          subtext: null,
+          cancellable: true,
+          jobId,
+        })
+      } else if (data.status === 'processing') {
+        replaceLastBotMessage({
+          type: 'converting',
+          text: `Converting ${file.name}...`,
+          subtext: isImage ? 'Reading the image — the first AI pass can take a few seconds…' : null,
+          cancellable: false,
+          jobId: null,
+        })
+      } else {
+        return data  // done | error | cancelled | password_required
+      }
+
+      await sleep(1000)
+    }
+  }, [])
+
+  // Cancel a still-queued conversion: tell the server to drop it, stop polling,
+  // and update the bubble.
+  const cancelQueuedJob = useCallback(async (jobId) => {
+    if (activeJobRef.current) activeJobRef.current.cancelled = true
+    try {
+      await axios.delete(`${BACKEND_URL}/api/convert/${jobId}`, { timeout: 30000 })
+    } catch {
+      // Ignore — the job may have just started or expired; UI is updated regardless.
+    }
+    replaceLastBotMessage({ type: 'error', text: 'Conversion cancelled — removed from the queue.' })
+    setIsConverting(false)
+  }, [])
 
   // Drag & Drop on the whole window
   useEffect(() => {
@@ -400,9 +576,18 @@ export default function App() {
             </button>
           )}
           {adminMode && <span className="header__badge header__badge--admin">🔓 ADMIN</span>}
+          <button
+            className="header__aboutbtn"
+            onClick={() => setShowAbout(true)}
+            title="About Us"
+          >
+            About Us
+          </button>
           <span className="header__badge">AI Converter</span>
         </div>
       </header>
+
+      {showAbout && <AboutModal onClose={() => setShowAbout(false)} />}
 
       {/* Drag overlay */}
       {isDragging && (
@@ -426,6 +611,7 @@ export default function App() {
               setPasswordInput={setPasswordInput}
               submitPassword={submitPassword}
               passwordInputRef={passwordInputRef}
+              onCancel={cancelQueuedJob}
             />
           ))}
           {isConverting && messages[messages.length - 1]?.type !== 'converting' && (

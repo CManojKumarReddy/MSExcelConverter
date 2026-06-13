@@ -1,0 +1,33 @@
+# Keep the build context small & avoid copying host-built artifacts into the image.
+
+# Python
+backend/venv/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+
+# Node / frontend build (rebuilt inside the image)
+frontend/node_modules/
+frontend/dist/
+
+# Backend runtime output (regenerated at runtime)
+backend/outputs/
+
+# VCS / IDE / OS
+.git/
+.gitignore
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Env / secrets — never bake these into the image
+*.env
+.env
+*.env.local
+
+# Docs / meta not needed at runtime
+README.md
+CLAUDE.md

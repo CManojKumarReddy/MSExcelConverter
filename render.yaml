@@ -1,0 +1,33 @@
+# Render Blueprint — one Docker web service that serves both the FastAPI API
+# and the built React frontend (single origin, no CORS).
+#
+# Deploy: push this repo to GitHub, then in Render → "New +" → "Blueprint" and
+# point it at the repo. Render reads this file and provisions the service.
+#
+# Docs: https://render.com/docs/blueprint-spec
+services:
+  - type: web
+    name: msexcel-converter
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter            # ~$7/mo, always-on. Use "free" to trial (sleeps when idle).
+    region: oregon           # change to the region closest to your users
+    healthCheckPath: /api    # returns 200 JSON — Render uses it to gate deploys
+    autoDeploy: true         # redeploy on every push to the connected branch
+    envVars:
+      # How many conversions run at once. Raise this when you upsize the plan
+      # (more RAM/CPU). 2 is safe for starter/free.
+      - key: MAX_CONCURRENT_CONVERSIONS
+        value: "2"
+      # How long finished jobs stay queryable before being pruned (seconds).
+      - key: JOB_RETENTION_SECONDS
+        value: "600"
+
+    # ── Optional: persist converted files across restarts/deploys ─────────────
+    # Outputs are short-lived (the user downloads right after converting), so a
+    # disk isn't required. Uncomment to keep files across restarts. NOTE: disks
+    # require a paid plan (not available on "free").
+    # disk:
+    #   name: outputs
+    #   mountPath: /app/backend/outputs
+    #   sizeGB: 1

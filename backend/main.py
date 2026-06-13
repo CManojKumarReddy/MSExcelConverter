@@ -5,15 +5,19 @@ Converts PDF, DOCX, Images, CSV, TXT to Excel (.xlsx)
 
 import os
 import re as _re
+import time
 import uuid
+import asyncio
 import logging
 import traceback
 from pathlib import Path
 from typing import Optional
+from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
@@ -77,6 +81,130 @@ OUTPUTS_DIR = Path(__file__).parent / "outputs"
 OUTPUTS_DIR.mkdir(exist_ok=True)
 
 ALLOWED_EXTENSIONS = {".pdf", ".docx", ".doc", ".png", ".jpg", ".jpeg", ".csv", ".txt"}
+
+# ── Conversion Job Queue ──────────────────────────────────────────────────────
+#
+# Conversions are CPU/RAM-heavy (Tesseract, pdfplumber, openpyxl). Running them
+# all at once under load exhausts memory and crashes the box. So every request
+# is turned into a Job and admitted through a semaphore that caps how many run
+# at the same time; the rest wait in a FIFO queue.
+#
+#   - MAX_CONCURRENT_CONVERSIONS   how many conversions run simultaneously.
+#                                  Bump this when you upsize the host.
+#   - JOB_RETENTION_SECONDS        how long finished jobs linger before pruning
+#                                  (so the client has time to read the result).
+#
+# A queued job can be cancelled (removed from the queue). A job that has already
+# started processing cannot — a running conversion in a worker thread can't be
+# safely interrupted.
+
+MAX_CONCURRENT = max(1, int(os.getenv("MAX_CONCURRENT_CONVERSIONS", "2")))
+JOB_RETENTION_SECONDS = int(os.getenv("JOB_RETENTION_SECONDS", "600"))
+
+_executor = ThreadPoolExecutor(max_workers=MAX_CONCURRENT, thread_name_prefix="convert")
+_semaphore: Optional[asyncio.Semaphore] = None
+_job_seq = 0
+
+
+def _get_semaphore() -> asyncio.Semaphore:
+    """Create the concurrency semaphore lazily, bound to the running event loop."""
+    global _semaphore
+    if _semaphore is None:
+        _semaphore = asyncio.Semaphore(MAX_CONCURRENT)
+    return _semaphore
+
+
+class Job:
+    """A single queued/running conversion and its result."""
+
+    def __init__(self, params: dict):
+        global _job_seq
+        _job_seq += 1
+        self.seq = _job_seq
+        self.id = uuid.uuid4().hex
+        self.params = params                 # args for _run_conversion
+        self.status = "queued"               # queued|processing|done|error|cancelled|password_required
+        self.output_filename: Optional[str] = None
+        self.message: Optional[str] = None
+        self.error: Optional[str] = None
+        self.password_provided = bool(params.get("password"))
+        self.created_at = time.time()
+        self.finished_at: Optional[float] = None
+        self.task: Optional[asyncio.Task] = None
+
+
+JOBS: dict[str, Job] = {}
+
+
+def _prune_jobs():
+    """Drop finished jobs older than the retention window to bound memory."""
+    now = time.time()
+    stale = [
+        jid for jid, j in JOBS.items()
+        if j.finished_at is not None and now - j.finished_at > JOB_RETENTION_SECONDS
+    ]
+    for jid in stale:
+        JOBS.pop(jid, None)
+
+
+def _queue_position(job: Job) -> int:
+    """How many not-yet-finished jobs sit ahead of this one (0 = up next/running)."""
+    return sum(
+        1 for j in JOBS.values()
+        if j.seq < job.seq and j.status in ("queued", "processing")
+    )
+
+
+async def _process_job(job: Job):
+    """Wait for a free slot, then run the conversion in a worker thread."""
+    sem = _get_semaphore()
+    try:
+        async with sem:
+            # The job may have been cancelled while waiting for a slot.
+            if job.status == "cancelled":
+                return
+            job.status = "processing"
+            loop = asyncio.get_event_loop()
+            try:
+                output_filename, msg = await loop.run_in_executor(
+                    _executor, _run_conversion, job.params
+                )
+                job.output_filename = output_filename
+                job.message = msg
+                job.status = "done"
+            except HTTPException as e:
+                if e.status_code == 423:          # password-protected PDF
+                    job.status = "password_required"
+                else:
+                    job.status = "error"
+                    job.error = str(e.detail)
+            except Exception as e:
+                log.error("Conversion error:\n%s", traceback.format_exc())
+                job.status = "error"
+                job.error = f"Conversion failed: {e}"
+    except asyncio.CancelledError:
+        # Cancelled while still waiting in the queue.
+        job.status = "cancelled"
+        raise
+    finally:
+        if job.status in ("done", "error", "cancelled", "password_required"):
+            job.finished_at = time.time()
+
+
+def _job_view(job: Job) -> dict:
+    """Serialise a job for the client."""
+    view = {"job_id": job.id, "status": job.status}
+    if job.status == "queued":
+        view["position"] = _queue_position(job)
+    elif job.status == "done":
+        view["output_filename"] = job.output_filename
+        view["message"] = job.message
+    elif job.status == "error":
+        view["detail"] = job.error or "Conversion failed."
+    elif job.status == "password_required":
+        view["password_provided"] = job.password_provided
+    return view
+
 
 # ── Excel Helpers ─────────────────────────────────────────────────────────────
 
@@ -2505,8 +2633,9 @@ def convert_image(content: bytes, stem: str, filename: str, merge_cols: bool = F
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 
-@app.get("/")
-async def root():
+@app.get("/api")
+async def api_root():
+    """Health/info endpoint (also used as the Render health check)."""
     return {"message": "DocToExcel API is running. POST /api/convert to convert files."}
 
 
@@ -2517,12 +2646,83 @@ async def cloud_ocr_status():
     return {"engine": _cloud_ocr_engine()}
 
 
+def _run_conversion(params: dict) -> tuple[str, str]:
+    """
+    Synchronous conversion core — runs inside a worker thread.
+    Returns (output_filename, log_message). Raises HTTPException(423) when a PDF
+    needs a password; other failures bubble up as exceptions.
+    """
+    content       = params["content"]
+    ext           = params["ext"]
+    stem          = params["stem"]
+    original_name = params["original_name"]
+    mode          = params["mode"]
+    password      = params["password"]
+    merge_cols    = params["merge_cols"]
+    use_azure     = params["use_azure"]
+
+    if ext == ".csv":
+        output_filename = convert_csv(content, stem)
+        msg = f'"{original_name}" has been converted successfully! Your Excel file is ready.'
+    elif ext == ".txt":
+        output_filename = convert_txt(content, stem)
+        msg = f'"{original_name}" has been converted successfully! Your Excel file is ready.'
+    elif ext == ".pdf":
+        output_filename = convert_pdf(content, stem, mode=mode, password=password)
+        if mode == "single":
+            msg = f'"{original_name}" converted! All tables are combined in one sheet.'
+        else:
+            msg = f'"{original_name}" converted! Each table/section is on a separate sheet.'
+    elif ext in (".docx", ".doc"):
+        output_filename = convert_docx(content, stem)
+        msg = f'"{original_name}" converted! Tables and text have been extracted to Excel.'
+    elif ext in (".png", ".jpg", ".jpeg"):
+        do_merge = merge_cols.lower() == "true"
+        want_cloud = use_azure.lower() == "true"   # admin "AI OCR (cloud)" toggle
+        output_filename = None
+        cloud_err = None                            # reason the cloud attempt failed
+        engine = _cloud_ocr_engine() if want_cloud else None
+        if engine == "gemini":
+            try:
+                output_filename = convert_image_gemini(content, stem, mode=mode, merge_cols=do_merge)
+                msg = f'"{original_name}" converted via Google Gemini.'
+            except CloudOCRUnavailable as e:
+                cloud_err = str(e)
+                log.warning("Gemini path unavailable, falling back to Tesseract: %s", e)
+        elif engine == "azure":
+            try:
+                output_filename = convert_image_azure(content, stem, mode=mode, merge_cols=do_merge)
+                msg = f'"{original_name}" converted via Azure Document Intelligence.'
+            except CloudOCRUnavailable as e:
+                cloud_err = str(e)
+                log.warning("Azure path unavailable, falling back to Tesseract: %s", e)
+        if output_filename is None:
+            output_filename = convert_image(content, stem, original_name, merge_cols=do_merge)
+            if not want_cloud:
+                msg = f'"{original_name}" processed via OCR. Extracted text has been placed in the Excel file.'
+            elif engine is None:
+                msg = (f'"{original_name}" processed via Tesseract OCR '
+                       f'(no cloud engine configured — see README).')
+            elif cloud_err and any(t in cloud_err.lower()
+                                   for t in ("429", "quota", "limit: 0", "resource_exhausted", "rate limit")):
+                msg = (f'"{original_name}" processed via Tesseract OCR '
+                       f"(cloud OCR daily quota reached — try again later).")
+            else:
+                msg = (f'"{original_name}" processed via Tesseract OCR '
+                       f'(cloud OCR temporarily unavailable).')
+    else:
+        raise HTTPException(status_code=400, detail=f"Unsupported file type: {ext}")
+
+    log.info("Conversion result: %s", msg)
+    return output_filename, msg
+
+
 @app.post("/api/convert")
 async def convert_file(file: UploadFile = File(...), mode: str = Form("single"), password: str = Form(""), merge_cols: str = Form("false"), use_azure: str = Form("false")):
     """
-    Accept an uploaded file and convert it to Excel.
-    mode: 'separate' (default) = one sheet per table/section; 'single' = all in one sheet.
-    Returns JSON: { output_filename, message }
+    Accept an uploaded file and enqueue it for conversion.
+    Returns immediately with { job_id, status, position } — poll
+    GET /api/convert/{job_id} for the result, or DELETE it to cancel while queued.
     """
     original_name = file.filename or "document"
     path = Path(original_name)
@@ -2541,72 +2741,54 @@ async def convert_file(file: UploadFile = File(...), mode: str = Form("single"),
     if len(content) == 0:
         raise HTTPException(status_code=400, detail="The uploaded file is empty.")
 
-    try:
-        if ext == ".csv":
-            output_filename = convert_csv(content, stem)
-            msg = f'"{original_name}" has been converted successfully! Your Excel file is ready.'
-        elif ext == ".txt":
-            output_filename = convert_txt(content, stem)
-            msg = f'"{original_name}" has been converted successfully! Your Excel file is ready.'
-        elif ext == ".pdf":
-            output_filename = convert_pdf(content, stem, mode=mode, password=password)
-            if mode == "single":
-                msg = f'"{original_name}" converted! All tables are combined in one sheet.'
-            else:
-                msg = f'"{original_name}" converted! Each table/section is on a separate sheet.'
-        elif ext in (".docx", ".doc"):
-            output_filename = convert_docx(content, stem)
-            msg = f'"{original_name}" converted! Tables and text have been extracted to Excel.'
-        elif ext in (".png", ".jpg", ".jpeg"):
-            do_merge = merge_cols.lower() == "true"
-            want_cloud = use_azure.lower() == "true"   # admin "AI OCR (cloud)" toggle
-            output_filename = None
-            cloud_err = None                            # reason the cloud attempt failed
-            engine = _cloud_ocr_engine() if want_cloud else None
-            if engine == "gemini":
-                try:
-                    output_filename = convert_image_gemini(content, stem, mode=mode, merge_cols=do_merge)
-                    msg = f'"{original_name}" converted via Google Gemini.'
-                except CloudOCRUnavailable as e:
-                    cloud_err = str(e)
-                    log.warning("Gemini path unavailable, falling back to Tesseract: %s", e)
-            elif engine == "azure":
-                try:
-                    output_filename = convert_image_azure(content, stem, mode=mode, merge_cols=do_merge)
-                    msg = f'"{original_name}" converted via Azure Document Intelligence.'
-                except CloudOCRUnavailable as e:
-                    cloud_err = str(e)
-                    log.warning("Azure path unavailable, falling back to Tesseract: %s", e)
-            if output_filename is None:
-                output_filename = convert_image(content, stem, original_name, merge_cols=do_merge)
-                if not want_cloud:
-                    msg = f'"{original_name}" processed via OCR. Extracted text has been placed in the Excel file.'
-                elif engine is None:
-                    msg = (f'"{original_name}" processed via Tesseract OCR '
-                           f'(no cloud engine configured — see README).')
-                elif cloud_err and any(t in cloud_err.lower()
-                                       for t in ("429", "quota", "limit: 0", "resource_exhausted", "rate limit")):
-                    msg = (f'"{original_name}" processed via Tesseract OCR '
-                           f"(cloud OCR daily quota reached — try again later).")
-                else:
-                    msg = (f'"{original_name}" processed via Tesseract OCR '
-                           f'(cloud OCR temporarily unavailable).')
-        else:
-            raise HTTPException(status_code=400, detail=f"Unsupported file type: {ext}")
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        log.error("Conversion error:\n%s", traceback.format_exc())
-        raise HTTPException(status_code=500, detail=f"Conversion failed: {str(e)}")
-
-    # Keep the engine/detail in the server log, but show the user a single clean,
-    # branded message regardless of which converter/engine ran.
-    log.info("Conversion result: %s", msg)
-    return JSONResponse({
-        "output_filename": output_filename,
-        "message": "Converted by MSExcelConverter",
+    _prune_jobs()
+    job = Job({
+        "content": content,
+        "ext": ext,
+        "stem": stem,
+        "original_name": original_name,
+        "mode": mode,
+        "password": password,
+        "merge_cols": merge_cols,
+        "use_azure": use_azure,
     })
+    JOBS[job.id] = job
+    job.task = asyncio.create_task(_process_job(job))
+
+    return JSONResponse(_job_view(job))
+
+
+@app.get("/api/convert/{job_id}")
+async def convert_status(job_id: str):
+    """Poll the status (and result, once done) of a queued/running conversion."""
+    job = JOBS.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found or expired.")
+    return JSONResponse(_job_view(job))
+
+
+@app.delete("/api/convert/{job_id}")
+async def cancel_conversion(job_id: str):
+    """
+    Cancel a conversion — only allowed while it is still queued. A job that has
+    already started processing can't be safely interrupted.
+    """
+    job = JOBS.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found or expired.")
+
+    if job.status == "queued":
+        job.status = "cancelled"        # set first so the worker skips it if it wins the slot race
+        if job.task:
+            job.task.cancel()
+        log.info("Cancelled queued job %s", job_id)
+        return JSONResponse({"job_id": job.id, "status": "cancelled"})
+
+    return JSONResponse(
+        {"job_id": job.id, "status": job.status,
+         "message": "Cannot cancel — conversion already processing or finished."},
+        status_code=409,
+    )
 
 
 @app.get("/api/download/{filename}")
@@ -2638,3 +2820,22 @@ async def list_files():
             "size_kb": round(f.stat().st_size / 1024, 1),
         })
     return {"files": files}
+
+
+# ── Serve the built frontend (production) ─────────────────────────────────────
+#
+# In production (Docker / Render) the React app is built to frontend/dist and
+# served by this same server, so the whole app is one origin (no CORS, one
+# service). In local dev this directory doesn't exist — run the Vite dev server
+# separately (it proxies /api/* back here), and this mount is simply skipped.
+#
+# Mounted LAST so every /api/* route above takes precedence over static files.
+
+_FRONTEND_DIST = Path(__file__).resolve().parent.parent / "frontend" / "dist"
+if _FRONTEND_DIST.is_dir():
+    app.mount("/", StaticFiles(directory=str(_FRONTEND_DIST), html=True), name="frontend")
+    log.info("Serving frontend from %s", _FRONTEND_DIST)
+else:
+    @app.get("/")
+    async def root():
+        return {"message": "DocToExcel API is running. Frontend not built; run the Vite dev server."}
