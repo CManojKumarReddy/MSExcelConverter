@@ -3,8 +3,11 @@ FROM node:20-slim AS frontend
 WORKDIR /build/frontend
 
 # Install deps from the lockfile first (better layer caching).
+# --legacy-peer-deps: vite 8 is newer than @vitejs/plugin-react@4's declared
+# peer range (vite ^4–^7), but the combo builds and runs fine. Strict `npm ci`
+# would otherwise abort with ERESOLVE.
 COPY frontend/package.json frontend/package-lock.json ./
-RUN npm ci
+RUN npm ci --legacy-peer-deps
 
 # Build the static site → /build/frontend/dist
 COPY frontend/ ./
