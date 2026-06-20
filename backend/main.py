@@ -2890,6 +2890,12 @@ async def api_root():
     return {"message": "DocToExcel API is running. POST /api/convert to convert files."}
 
 
+@app.get("/api/config")
+async def api_config():
+    """Return public client-side config (safe to expose — no secrets here)."""
+    return {"google_client_id": GOOGLE_CLIENT_ID}
+
+
 @app.get("/api/cloud-ocr-status")
 async def cloud_ocr_status():
     """Which cloud OCR engine is configured server-side ('gemini' | 'azure' | null).

@@ -22,6 +22,27 @@ services:
       # How long finished jobs stay queryable before being pruned (seconds).
       - key: JOB_RETENTION_SECONDS
         value: "600"
+      # ── Cloud OCR (Google Gemini) — optional, much faster + more accurate ───
+      # Enables the admin-mode "AI OCR (cloud)" path for image conversion
+      # (Ctrl+M+S in the UI). Enter the actual key in the Render dashboard
+      # (Environment tab) — sync:false keeps the secret out of this repo.
+      # Without it, image OCR uses the bundled Tesseract/RapidOCR (slower).
+      - key: GEMINI_API_KEY
+        sync: false
+      # Optional — these match the in-code defaults; override only to change models.
+      - key: GEMINI_MODEL
+        value: "gemini-2.5-flash"
+      - key: GEMINI_FALLBACK_MODEL
+        value: "gemini-2.0-flash"
+      # ── Google Sign-In ────────────────────────────────────────────────────────
+      # OAuth 2.0 Client ID from https://console.cloud.google.com/apis/credentials
+      # Set the actual value in the Render dashboard (Environment tab).
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      # Random secret for signing session tokens — generate with:
+      #   py -c "import secrets; print(secrets.token_hex(32))"
+      - key: JWT_SECRET
+        sync: false
 
     # ── Optional: persist converted files across restarts/deploys ─────────────
     # Outputs are short-lived (the user downloads right after converting), so a
