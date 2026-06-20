@@ -7,17 +7,22 @@ import os
 import re as _re
 import time
 import uuid
+import hmac
+import json
+import base64
 import asyncio
 import logging
+import secrets
 import traceback
 from pathlib import Path
 from typing import Optional
 from concurrent.futures import ThreadPoolExecutor
 
-from fastapi import FastAPI, File, Form, UploadFile, HTTPException
+from fastapi import FastAPI, File, Form, UploadFile, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
@@ -42,6 +47,8 @@ except Exception:
 AZURE_DI_ENDPOINT = os.getenv("AZURE_DI_ENDPOINT", "").strip()
 AZURE_DI_KEY      = os.getenv("AZURE_DI_KEY", "").strip()
 GEMINI_API_KEY    = os.getenv("GEMINI_API_KEY", "").strip()
+GOOGLE_CLIENT_ID  = os.getenv("GOOGLE_CLIENT_ID", "").strip()
+JWT_SECRET        = os.getenv("JWT_SECRET", secrets.token_hex(32))
 
 
 def _azure_configured() -> bool:
@@ -198,12 +205,111 @@ def _job_view(job: Job) -> dict:
         view["position"] = _queue_position(job)
     elif job.status == "done":
         view["output_filename"] = job.output_filename
-        view["message"] = job.message
+        # Single clean, branded message to the user; the detailed engine/result
+        # line stays in the server log (emitted by _run_conversion).
+        view["message"] = "Converted by MSExcelConverter"
     elif job.status == "error":
         view["detail"] = job.error or "Conversion failed."
     elif job.status == "password_required":
         view["password_provided"] = job.password_provided
     return view
+
+
+# ── Auth helpers ─────────────────────────────────────────────────────────────
+
+_SESSION_DURATION = 60 * 60 * 24 * 7  # 7 days
+
+
+def _create_session_token(user_info: dict) -> str:
+    payload = json.dumps({
+        "sub":     user_info["sub"],
+        "email":   user_info["email"],
+        "name":    user_info.get("name", ""),
+        "picture": user_info.get("picture", ""),
+        "exp":     int(time.time()) + _SESSION_DURATION,
+    }, separators=(",", ":"))
+    payload_b64 = base64.urlsafe_b64encode(payload.encode()).decode().rstrip("=")
+    sig = hmac.new(JWT_SECRET.encode(), payload_b64.encode(), "sha256").hexdigest()
+    return f"{payload_b64}.{sig}"
+
+
+def _verify_session_token(token: str) -> Optional[dict]:
+    try:
+        payload_b64, sig = token.rsplit(".", 1)
+        expected = hmac.new(JWT_SECRET.encode(), payload_b64.encode(), "sha256").hexdigest()
+        if not hmac.compare_digest(sig, expected):
+            return None
+        padding = "=" * (-len(payload_b64) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64 + padding).decode())
+        if payload.get("exp", 0) < time.time():
+            return None
+        return payload
+    except Exception:
+        return None
+
+
+_bearer = HTTPBearer(auto_error=False)
+
+
+def get_current_user(
+    creds: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
+) -> dict:
+    if not creds:
+        raise HTTPException(status_code=401, detail="Not authenticated.")
+    user = _verify_session_token(creds.credentials)
+    if not user:
+        raise HTTPException(status_code=401, detail="Session expired or invalid.")
+    return user
+
+
+# ── Auth routes ───────────────────────────────────────────────────────────────
+
+class _AuthRequest:
+    pass
+
+
+from pydantic import BaseModel
+
+class GoogleAuthRequest(BaseModel):
+    credential: str  # Google ID token from the frontend
+
+
+@app.post("/api/auth/google")
+async def auth_google(body: GoogleAuthRequest):
+    """Verify a Google ID token and return a session token."""
+    if not GOOGLE_CLIENT_ID:
+        raise HTTPException(
+            status_code=503,
+            detail="Google Sign-In is not configured on this server. Set GOOGLE_CLIENT_ID in the backend .env file.",
+        )
+    try:
+        from google.oauth2 import id_token
+        from google.auth.transport import requests as google_requests
+        idinfo = id_token.verify_oauth2_token(
+            body.credential,
+            google_requests.Request(),
+            GOOGLE_CLIENT_ID,
+        )
+    except Exception as exc:
+        log.warning("Google token verification failed: %s", exc)
+        raise HTTPException(status_code=401, detail="Invalid Google credential.")
+
+    session_token = _create_session_token(idinfo)
+    return {
+        "token": session_token,
+        "user": {
+            "sub":     idinfo["sub"],
+            "email":   idinfo["email"],
+            "name":    idinfo.get("name", ""),
+            "picture": idinfo.get("picture", ""),
+        },
+    }
+
+
+@app.get("/api/auth/me")
+async def auth_me(user: dict = Depends(get_current_user)):
+    """Return the currently authenticated user's profile."""
+    return {"user": {k: user[k] for k in ("sub", "email", "name", "picture") if k in user}}
 
 
 # ── Excel Helpers ─────────────────────────────────────────────────────────────
@@ -2549,6 +2655,141 @@ def convert_image(content: bytes, stem: str, filename: str, merge_cols: bool = F
             rows = meta_rows + [[""]] + rows
         return rows
 
+    # ── Multi-table sectioning ────────────────────────────────────────────────
+    # A single image can stack several tables with DIFFERENT column layouts
+    # (e.g. an Employee table above a Project table). Forcing them through one
+    # global column grid mis-aligns every table but the first. So split the
+    # line_groups into vertical sections at large gaps and detect columns for
+    # each section independently, then stack the results with a blank separator.
+    def _render_lines(lgs, col_boundaries):
+        """Render a subset of line_groups to rows using the given boundaries."""
+        if col_boundaries and len(col_boundaries) > 2:
+            out = []
+            for line in lgs:
+                cells = _line_to_cells_fixed(line, col_boundaries)
+                if any(c.strip() for c in cells):
+                    out.append(cells)
+            return out
+        return [[" ".join(wd["text"] for wd in line)] for line in lgs if line]
+
+    def _assign_cells(ln, bounds):
+        """Assign each word to the column its horizontal centre falls into.
+        Generic (no bank-statement 'last column must be numeric' rule), so it
+        keeps multi-word cells like 'Project Alpha' / 'Hire Date' intact."""
+        ncols = len(bounds) - 1
+        cells = [""] * ncols
+        for w in sorted(ln, key=lambda x: x["left"]):
+            cx = (w["left"] + w["right"]) / 2
+            ci = 0
+            for j in range(1, ncols):
+                if cx >= bounds[j]:
+                    ci = j
+            cells[ci] = (cells[ci] + " " + w["text"]).strip()
+        return cells
+
+    def _is_body_line(ln):
+        """A table row splits into ≥2 cells by large inter-word gaps; a section
+        title / caption is a single contiguous phrase (1 cell)."""
+        return len(_line_to_cells_gap(ln)) >= 2
+
+    def _section_columns(body_words):
+        """Column boundaries from vertical whitespace that is empty across ALL
+        body rows (a vertical-projection / zone histogram over the table body
+        only — titles excluded). Robust to multi-word cells: a gap inside a cell
+        like 'Project Alpha' is covered in other rows, so no boundary lands
+        there."""
+        n_zones = 60
+        zone_w  = max(1.0, img_width / n_zones)
+        cov = [False] * n_zones
+        for wd in body_words:
+            z0 = int(wd["left"] / zone_w)
+            z1 = int(wd["right"] / zone_w)
+            for z in range(max(0, z0), min(n_zones, z1 + 1)):
+                cov[z] = True
+        bounds = [0]
+        z = 0
+        while z < n_zones:
+            if not cov[z]:
+                gs = z
+                while z < n_zones and not cov[z]:
+                    z += 1
+                # Internal gap only: skip the left margin (gs == 0) and the right
+                # margin (z == n_zones) so they don't create empty edge columns.
+                if gs > 0 and z < n_zones and z - gs >= 2:
+                    bounds.append(int(((gs + z) / 2) * zone_w))
+            else:
+                z += 1
+        bounds.append(img_width)
+        return bounds if len(bounds) > 2 else None
+
+    def _best_section_rows(lgs):
+        """Best column layout for one section in isolation.
+
+        Primary: separate title/caption lines from the table body, detect
+        columns by vertical projection over the body, and render — titles become
+        single-cell rows, body rows align to real columns. Falls back to the
+        generic cascade / left-edge strategies when no clear body is present."""
+        body_lines = [ln for ln in lgs if _is_body_line(ln)]
+        if len(body_lines) >= 2:
+            body_words = [w for ln in body_lines for w in ln]
+            bounds = _section_columns(body_words)
+            if bounds is not None:
+                out = []
+                for ln in lgs:
+                    if _is_body_line(ln):
+                        cells = _assign_cells(ln, bounds)
+                        if any(c.strip() for c in cells):
+                            out.append(cells)
+                    else:
+                        txt = " ".join(w["text"] for w in ln).strip()
+                        if txt:
+                            out.append([txt])
+                if out:
+                    return out
+        # Fallback: generic strategies on the whole section.
+        cands = [_render_lines(lgs, _cascade_col_boundaries(lgs))]
+        _lb = _columns_from_left_edges(lgs, img_width)
+        if _lb is not None:
+            cands.append(_render_lines(lgs, _lb))
+        return max(cands, key=_score_table_rows)
+
+    def _img_section_buckets(lgs):
+        """Split line_groups into sections at vertical gaps markedly larger than
+        the typical row pitch. Uniform single tables stay as one section."""
+        if len(lgs) <= 3:
+            return [lgs]
+        tops = [l[0]["top"] for l in lgs]
+        gaps = sorted(tops[i + 1] - tops[i] for i in range(len(tops) - 1))
+        med  = gaps[len(gaps) // 2] or 1
+        # Row pitch within a table is very uniform, so a section break stands out
+        # as a clear outlier. 1.4x the median catches it; the "≥2 tableish
+        # sections" guard downstream prevents over-splitting a single table.
+        thr  = max(med * 1.4, avg_h * 1.8)
+        buckets = [[lgs[0]]]
+        for i in range(1, len(lgs)):
+            if tops[i] - tops[i - 1] > thr:
+                buckets.append([])
+            buckets[-1].append(lgs[i])
+        return buckets
+
+    def _tableish(rows):
+        dr = [r for r in rows if any(str(c).strip() for c in r)]
+        return len(dr) >= 2 and max((len(r) for r in dr), default=0) >= 2
+
+    _buckets = _img_section_buckets(line_groups)
+    _sectioned_rows = None
+    if len(_buckets) >= 2:
+        _section_rows = [_best_section_rows(b) for b in _buckets]
+        if sum(1 for sr in _section_rows if _tableish(sr)) >= 2:
+            stacked: list[list[str]] = []
+            for sr in _section_rows:
+                if not sr:
+                    continue
+                if stacked:
+                    stacked.append([])          # blank separator between tables
+                stacked.extend(sr)
+            _sectioned_rows = stacked
+
     # ── Collect candidate results from each applicable strategy ───────────────
     candidates: list[tuple[str, list]] = []
 
@@ -2605,9 +2846,19 @@ def convert_image(content: bytes, stem: str, filename: str, merge_cols: bool = F
         return _score_table_rows(c[1]) + _CONF_BONUS.get(c[0], 0.0)
 
     best_name, rows = max(candidates, key=_cand_score)
+    _scores = {n: round(_cand_score((n, r)), 2) for n, r in candidates}
+
+    # Multi-table override: when several tables were detected as separate
+    # sections, prefer the per-section layout over the global text strategies
+    # (which mis-align stacked tables). Never override a strong structural
+    # match (drawn grid / coloured header band / ruled columns).
+    if _sectioned_rows is not None and best_name in ("word_based", "left_aligned"):
+        rows = _sectioned_rows
+        best_name = "sectioned"
+
     log.info(
         "Image strategy scores: %s → chose '%s'",
-        {n: round(_cand_score((n, r)), 2) for n, r in candidates},
+        _scores,
         best_name,
     )
 
@@ -2718,7 +2969,7 @@ def _run_conversion(params: dict) -> tuple[str, str]:
 
 
 @app.post("/api/convert")
-async def convert_file(file: UploadFile = File(...), mode: str = Form("single"), password: str = Form(""), merge_cols: str = Form("false"), use_azure: str = Form("false")):
+async def convert_file(file: UploadFile = File(...), mode: str = Form("single"), password: str = Form(""), merge_cols: str = Form("false"), use_azure: str = Form("false"), user: dict = Depends(get_current_user)):
     """
     Accept an uploaded file and enqueue it for conversion.
     Returns immediately with { job_id, status, position } — poll
