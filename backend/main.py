@@ -294,6 +294,7 @@ async def auth_google(body: GoogleAuthRequest):
         log.warning("Google token verification failed: %s", exc)
         raise HTTPException(status_code=401, detail="Invalid Google credential.")
 
+    log.info("User signed in: %s (%s)", idinfo.get("email"), idinfo.get("name"))
     session_token = _create_session_token(idinfo)
     return {
         "token": session_token,
