@@ -294,6 +294,7 @@ async def auth_google(body: GoogleAuthRequest):
         log.warning("Google token verification failed: %s", exc)
         raise HTTPException(status_code=401, detail="Invalid Google credential.")
 
+    log.info("User signed in: %s (%s)", idinfo.get("email"), idinfo.get("name"))
     session_token = _create_session_token(idinfo)
     return {
         "token": session_token,
@@ -955,6 +956,25 @@ def _ocr_pdf_pages(content: bytes) -> list[tuple[str, list[list[str]]]]:
     return results
 
 
+def _dedupe_chars_str(s: str) -> str:
+    """Fix PDFs with doubled text layers: 'PPeerrssoonn' → 'Person'."""
+    if not s or len(s) < 4:
+        return s
+    # Check if every pair of adjacent chars is the same (fully doubled text).
+    pairs_match = all(s[i] == s[i + 1] for i in range(0, len(s) - 1, 2))
+    if pairs_match and len(s) % 2 == 0:
+        return s[::2]
+    return s
+
+
+def _dedupe_table(table):
+    """Apply _dedupe_chars_str to every cell in a pdfplumber table."""
+    return [
+        [_dedupe_chars_str(cell) if isinstance(cell, str) else cell for cell in row]
+        for row in table
+    ]
+
+
 def convert_pdf(content: bytes, stem: str, mode: str = "single", password: str = "") -> str:
     """PDF → Excel. mode='separate' puts each table/section on its own sheet;
     mode='single' stacks everything into one sheet.
@@ -1085,10 +1105,10 @@ def convert_pdf(content: bytes, stem: str, mode: str = "single", password: str =
         for page_num, page in enumerate(pdf.pages, start=1):
             # ── Try structured table extraction first (bordered PDFs) ──────────
             try:
-                tables = page.extract_tables()
+                tables = page.extract_tables(table_settings={"text_tolerance": 3, "snap_tolerance": 3})
             except Exception:
                 tables = []
-            page_tables = [t for t in (tables or []) if _is_useful_table(t)]
+            page_tables = [_dedupe_table(t) for t in (tables or []) if _is_useful_table(t)]
             # If any extracted table is degenerate (rows not segmented — typical
             # of bank statements with no inter-row lines), abandon the structured
             # path for the WHOLE page and let the word-based pipeline handle it.
@@ -1108,7 +1128,7 @@ def convert_pdf(content: bytes, stem: str, mode: str = "single", password: str =
                 page_data.append((page_num, int(page.width), []))
                 continue
 
-            raw = page.extract_words(keep_blank_chars=False, use_text_flow=False)
+            raw = page.extract_words(keep_blank_chars=False, use_text_flow=False, dedupe_chars=True)
             if not raw:
                 page_data.append((page_num, int(page.width), []))
                 continue
